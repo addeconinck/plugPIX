@@ -1,0 +1,19 @@
+# Virtual environment
+venv/
+.venv/
+
+# Local database (runtime state — do not commit; it also holds the admin password hash)
+charging.db
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

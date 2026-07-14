@@ -1,0 +1,5 @@
+# Hide the auto-generated multipage navigation so the Admin page doesn't show
+# up in the sidebar. The board is the only page users need; the Admin page is
+# still reachable by URL (append /Admin) and is password-protected.
+[client]
+showSidebarNavigation = false
