@@ -510,23 +510,33 @@ def render_point(point: str, me: str, booking_on: bool,
                     f"Booked by **{who}** — free ~{fmt_time(parse(booking_now['end_at']))}"
                 )
 
+        can_act = me is not None
         with header[1]:
             if not in_use:
-                with st.popover("⚡ Claim now", use_container_width=True):
-                    st.write(f"Claim **{point}** for **{me}**")
-                    choice = st.select_slider(
-                        "I'll be done in…",
-                        options=list(eta_choices),
-                        value="1 h",
-                        key=f"eta-{point}",
+                if not can_act:
+                    st.button(
+                        "⚡ Claim now",
+                        key=f"claim-btn-{point}",
+                        use_container_width=True,
+                        disabled=True,
+                        help="Select your name first.",
                     )
-                    mins = eta_choices[choice]
-                    eta_dt = now() + dt.timedelta(minutes=mins) if mins else None
-                    if eta_dt:
-                        st.caption(f"Frees up around **{fmt_time(eta_dt)}**")
-                    if st.button("Confirm claim", key=f"claim-{point}", type="primary"):
-                        claim_point(point, me, eta_dt)
-                        st.rerun()
+                else:
+                    with st.popover("⚡ Claim now", use_container_width=True):
+                        st.write(f"Claim **{point}** for **{me}**")
+                        choice = st.select_slider(
+                            "I'll be done in…",
+                            options=list(eta_choices),
+                            value="1 h",
+                            key=f"eta-{point}",
+                        )
+                        mins = eta_choices[choice]
+                        eta_dt = now() + dt.timedelta(minutes=mins) if mins else None
+                        if eta_dt:
+                            st.caption(f"Frees up around **{fmt_time(eta_dt)}**")
+                        if st.button("Confirm claim", key=f"claim-{point}", type="primary"):
+                            claim_point(point, me, eta_dt)
+                            st.rerun()
             elif claim is not None:
                 if claim["person"] == me:
                     if st.button(
@@ -577,6 +587,15 @@ def render_point(point: str, me: str, booking_on: bool,
 
         if not booking_on:
             return
+        if not can_act:
+            st.button(
+                "📅 Book a slot today",
+                key=f"book-btn-{point}",
+                use_container_width=True,
+                disabled=True,
+                help="Select your name first.",
+            )
+            return
         slot_min, slot_max = slot_bounds()
         with st.popover("📅 Book a slot today", use_container_width=True):
             st.write(f"Book **{point}** for **{me}** — today only")
@@ -616,7 +635,12 @@ def render_point(point: str, me: str, booking_on: bool,
 
 
 def main() -> None:
-    st.set_page_config(page_title="plugPIX · EV charging", page_icon="⚡", layout="wide")
+    st.set_page_config(
+        page_title="plugPIX · EV charging",
+        page_icon="⚡",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     st.markdown(MOBILE_CSS, unsafe_allow_html=True)
     init_db()
 
@@ -658,78 +682,66 @@ def main() -> None:
         plate = plate_by_name.get(name)
         return f"{name} — {plate}" if plate else name
 
-    with st.sidebar:
-        st.header("Who are you?")
-        me = st.selectbox(
-            "Your name",
-            names,
-            index=None,
-            placeholder="Select your name…",
-            format_func=name_label,
-            key="me",
-        )
-        if me:
-            plate = plate_of(me)
-            st.caption(f"🚗 {plate}" if plate else "No plate on file.")
-        st.caption("Remembered while this tab stays open.")
+    # --- Who are you? (on the main page) ---
+    # Apply a name selection queued after adding a new person (must happen
+    # before the selectbox widget is created).
+    if "pending_me" in st.session_state:
+        st.session_state["me"] = st.session_state.pop("pending_me")
+
+    ADD_NEW = "➕ Add a new person…"
+    choice = st.selectbox(
+        "Your name",
+        names + [ADD_NEW],
+        index=None,
+        placeholder="Select your name…",
+        format_func=lambda o: o if o == ADD_NEW else name_label(o),
+        key="me",
+    )
+
+    me = None  # stays None (claim/book locked) until a known name is chosen
+    if choice == ADD_NEW:
+        with st.form("add_me"):
+            nm = st.text_input("Your name")
+            pl = st.text_input("Number plate (optional)", placeholder="1-ABC-123")
+            added = st.form_submit_button("➕ Add & select", type="primary")
+        if added:
+            name = nm.strip()
+            norm = normalize_plate(pl)
+            if not name:
+                st.error("Please enter a name.")
+            elif name.casefold() in {n.casefold() for n in names}:
+                st.error(f"“{name}” already exists — pick it from the list.")
+            elif pl.strip() and norm is None:
+                st.error("Plate must look like 1-ABC-123 (Belgian format).")
+            else:
+                add_person(name, norm or "")
+                st.session_state["pending_me"] = name  # auto-select after rerun
+                st.rerun()
+    elif choice:
+        me = choice
+        plate = plate_of(me)
+        st.caption(f"🚗 {plate}" if plate else "No plate on file.")
+    else:
+        st.info("👆 Select your name (or add yourself) to claim or book a charge point.")
+
+    # --- Controls ---
+    c1, c2 = st.columns([1, 1])
+    c1.metric("Free right now", f"{len(free_now)} / {len(points)}")
+    with c2:
+        st.checkbox("🔔 Alert me when any point frees up", key="watch_any")
         if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
 
-        st.divider()
-        free = len(free_now)
-        st.metric("Free right now", f"{free} / {len(points)}")
-        st.checkbox("🔔 Alert me when any point frees up", key="watch_any")
-        if st.session_state.get("watch_any"):
-            st.caption("You'll be alerted whenever a charge point becomes free.")
+    st.divider()
 
-        st.divider()
-        with st.expander("👥 Manage people"):
-            with st.form("add_person", clear_on_submit=True):
-                new_name = st.text_input("Name")
-                new_plate = st.text_input("Plate", placeholder="1-ABC-123")
-                submitted = st.form_submit_button("➕ Add person")
-            if submitted:
-                name = new_name.strip()
-                norm = normalize_plate(new_plate)
-                if not name:
-                    st.error("Please enter a name.")
-                elif name.casefold() in {n.casefold() for n in names}:
-                    st.error(f"“{name}” already exists.")
-                elif new_plate.strip() and norm is None:
-                    st.error("Plate must look like 1-ABC-123 (Belgian format).")
-                else:
-                    add_person(name, norm or "")
-                    st.rerun()
-
-            if people:
-                st.caption("Current people")
-                for p in people:
-                    c1, c2 = st.columns([5, 1])
-                    label = f"**{p['name']}**"
-                    label += f" — {p['plate']}" if p["plate"] else " — _no plate_"
-                    c1.markdown(label)
-                    if c2.button("🗑", key=f"delp-{p['id']}", help="Remove"):
-                        remove_person(p["id"])
-                        st.rerun()
-
-    if not names:
-        st.warning(
-            "No people yet. Open **👥 Manage people** in the sidebar to add someone "
-            "(name + Belgian plate)."
-        )
-
-    if not me:
-        st.info("👈 Select your name in the sidebar to claim or book a charge point.")
-        # Still show the read-only status.
-        me = "\0"  # sentinel that matches nobody
-
+    # --- The board: two per row so mobile stacks them in order (1, 2, 3, 4) ---
     if not points:
-        st.warning("No charge points configured. Add some on the **Admin** page.")
-
-    cols = st.columns(2)
-    for i, point in enumerate(points):
-        with cols[i % 2]:
-            render_point(point, me, booking_on, eta_choices)
+        st.warning("No charge points configured. Add some on the Admin page.")
+    for i in range(0, len(points), 2):
+        cols = st.columns(2)
+        for j, point in enumerate(points[i:i + 2]):
+            with cols[j]:
+                render_point(point, me, booking_on, eta_choices)
 
 
 if __name__ == "__main__":

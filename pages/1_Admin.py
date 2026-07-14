@@ -94,6 +94,46 @@ def main() -> None:
 
     st.divider()
 
+    # ---------------------------------------------------------------- People
+    st.subheader("People")
+    st.caption(
+        "Employees can add themselves from the “Your name” dropdown on the board. "
+        "Use this to remove or fix entries."
+    )
+    ppl = app.list_people()
+    if not ppl:
+        st.info("No people yet.")
+    for person in ppl:
+        c1, c2 = st.columns([5, 1])
+        label = f"**{person['name']}**"
+        label += f" — {person['plate']}" if person["plate"] else " — _no plate_"
+        c1.markdown(label)
+        if c2.button("🗑 Remove", key=f"delp-{person['id']}", use_container_width=True):
+            app.remove_person(person["id"])
+            st.rerun()
+
+    with st.form("admin_add_person", clear_on_submit=True):
+        cols = st.columns([3, 3, 1])
+        an = cols[0].text_input("Name", label_visibility="collapsed", placeholder="Name")
+        ap = cols[1].text_input(
+            "Plate", label_visibility="collapsed", placeholder="1-ABC-123 (optional)"
+        )
+        addp = cols[2].form_submit_button("➕ Add", use_container_width=True)
+    if addp:
+        name = an.strip()
+        norm = app.normalize_plate(ap)
+        if not name:
+            st.error("Enter a name.")
+        elif name.casefold() in {p["name"].casefold() for p in ppl}:
+            st.error(f"“{name}” already exists.")
+        elif ap.strip() and norm is None:
+            st.error("Plate must look like 1-ABC-123 (Belgian format).")
+        else:
+            app.add_person(name, norm or "")
+            st.rerun()
+
+    st.divider()
+
     # --------------------------------------------------------------- Settings
     st.subheader("Settings")
     with st.form("settings"):
