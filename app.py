@@ -23,6 +23,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
+    event,
     func,
     insert,
     select,
@@ -159,9 +160,22 @@ _engines: dict[str, Engine] = {}
 def _engine_for(url: str) -> Engine:
     if url not in _engines:
         connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-        _engines[url] = create_engine(
+        engine = create_engine(
             url, connect_args=connect_args, pool_pre_ping=True, pool_recycle=300,
         )
+        if url.startswith("sqlite"):
+            # WAL lets readers (e.g. the background mirror worker) run without
+            # blocking a writer; busy_timeout makes brief contention wait rather
+            # than fail with "database is locked". Essential once a background
+            # thread touches the same file as request handlers.
+            @event.listens_for(engine, "connect")
+            def _sqlite_pragmas(dbapi_conn, _rec):  # noqa: ANN001
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.execute("PRAGMA busy_timeout=5000")
+                cur.execute("PRAGMA synchronous=NORMAL")
+                cur.close()
+        _engines[url] = engine
     return _engines[url]
 
 

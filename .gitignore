@@ -5,6 +5,8 @@ venv/
 # Local database (runtime state — do not commit; it also holds the admin password hash)
 charging.db
 *.db
+*.db-wal
+*.db-shm
 
 # Streamlit secrets (database connection string, etc.) — never commit
 .streamlit/secrets.toml
