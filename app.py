@@ -244,10 +244,11 @@ def _bootstrap() -> bool:
     """Run ONCE per process: create schema, restore from Neon, start the worker.
 
     Cached via st.cache_resource so it does NOT re-run (and therefore does not
-    re-restore over live changes) on every Streamlit rerun.
+    re-restore over live changes) on every Streamlit rerun. NOTE: schema creation
+    is deliberately NOT here — it lives in init_db() so it runs every rerun and
+    can't be skipped by a stale cache after a code change adds a table.
     """
     local = get_engine()
-    _metadata.create_all(local)
 
     neon = get_neon_engine()
     status = _shared()["status"]
@@ -273,6 +274,10 @@ def _bootstrap() -> bool:
 
 
 def init_db() -> None:
+    # Ensure the local schema every rerun (cheap + idempotent on SQLite). This
+    # must NOT be inside the cached _bootstrap: after a deploy that adds a table,
+    # a stale cache_resource entry would skip create_all and leave it missing.
+    _metadata.create_all(get_engine())
     _bootstrap()
 
 
