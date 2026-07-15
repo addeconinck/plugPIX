@@ -192,7 +192,7 @@ def main() -> None:
             "connection string in Secrets to enable durable backups."
         )
     else:
-        status = app._backup_status
+        status = app.backup_status()
         if status["restored"]:
             st.caption("↩️ Restored from Neon on startup.")
         if status["last_ok"]:
@@ -211,7 +211,7 @@ def main() -> None:
             if ok:
                 st.success("Backup complete.")
             else:
-                st.error(f"Backup failed: {app._backup_status['last_error']}")
+                st.error(f"Backup failed: {app.backup_status()['last_error']}")
 
     st.divider()
 

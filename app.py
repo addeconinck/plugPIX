@@ -125,9 +125,6 @@ LOCAL_URL = f"sqlite:///{DB_PATH}"
 
 _TABLES = [live, bookings, people, points, settings]
 
-# Backup status, surfaced on the Admin page.
-_backup_status: dict = {"last_ok": None, "last_error": None, "restored": False}
-
 
 def _neon_url() -> str | None:
     """Backup database URL from Streamlit secrets, or None if not configured.
@@ -154,40 +151,54 @@ def _neon_url() -> str | None:
     return url
 
 
-_engines: dict[str, Engine] = {}
+def _make_engine(url: str) -> Engine:
+    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+    engine = create_engine(
+        url, connect_args=connect_args, pool_pre_ping=True, pool_recycle=300,
+    )
+    if url.startswith("sqlite"):
+        # WAL lets readers (e.g. the background mirror worker) run without
+        # blocking a writer; busy_timeout makes brief contention wait rather
+        # than fail with "database is locked".
+        @event.listens_for(engine, "connect")
+        def _sqlite_pragmas(dbapi_conn, _rec):  # noqa: ANN001
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=5000")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.close()
+    return engine
 
 
-def _engine_for(url: str) -> Engine:
-    if url not in _engines:
-        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-        engine = create_engine(
-            url, connect_args=connect_args, pool_pre_ping=True, pool_recycle=300,
-        )
-        if url.startswith("sqlite"):
-            # WAL lets readers (e.g. the background mirror worker) run without
-            # blocking a writer; busy_timeout makes brief contention wait rather
-            # than fail with "database is locked". Essential once a background
-            # thread touches the same file as request handlers.
-            @event.listens_for(engine, "connect")
-            def _sqlite_pragmas(dbapi_conn, _rec):  # noqa: ANN001
-                cur = dbapi_conn.cursor()
-                cur.execute("PRAGMA journal_mode=WAL")
-                cur.execute("PRAGMA busy_timeout=5000")
-                cur.execute("PRAGMA synchronous=NORMAL")
-                cur.close()
-        _engines[url] = engine
-    return _engines[url]
-
-
+# IMPORTANT: Streamlit re-executes this whole script on every rerun, so ordinary
+# module-level globals are reset each time. Anything that must survive across
+# reruns (engines, the "already initialised" flag, the mirror worker + its
+# events) lives in st.cache_resource, which persists for the life of the process.
+@st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
     """The app always talks to the fast, local SQLite database."""
-    return _engine_for(LOCAL_URL)
+    return _make_engine(LOCAL_URL)
 
 
+@st.cache_resource(show_spinner=False)
 def get_neon_engine() -> Engine | None:
     """The durable backup database (Postgres/Neon), or None if not configured."""
     url = _neon_url()
-    return _engine_for(url) if url else None
+    return _make_engine(url) if url else None
+
+
+@st.cache_resource(show_spinner=False)
+def _shared() -> dict:
+    """Cross-rerun, cross-thread state: mirror signals + backup status."""
+    return {
+        "event": threading.Event(),   # a change happened → mirror soon
+        "dirty": threading.Event(),   # local has changes not yet safe in Neon
+        "status": {"last_ok": None, "last_error": None, "restored": False},
+    }
+
+
+def backup_status() -> dict:
+    return _shared()["status"]
 
 
 def _copy_all(src: Engine, dst: Engine) -> None:
@@ -225,40 +236,47 @@ def _seed_defaults(engine: Engine) -> None:
                 conn.execute(insert(settings).values(key=key, value=value))
 
 
-_inited = False
+_RETRY_INTERVAL = 120  # seconds; retry a failed/pending mirror
 
 
-def init_db() -> None:
-    """Prepare local SQLite once per process; restore from Neon if available."""
-    global _inited
-    if _inited:
-        return
+@st.cache_resource(show_spinner=False)
+def _bootstrap() -> bool:
+    """Run ONCE per process: create schema, restore from Neon, start the worker.
+
+    Cached via st.cache_resource so it does NOT re-run (and therefore does not
+    re-restore over live changes) on every Streamlit rerun.
+    """
     local = get_engine()
     _metadata.create_all(local)
 
     neon = get_neon_engine()
+    status = _shared()["status"]
     if neon is not None:
         try:
             _metadata.create_all(neon)
             # Neon is the durable source of truth: restore it into local SQLite.
             if _engine_has_data(neon):
                 _copy_all(src=neon, dst=local)
-                _backup_status["restored"] = True
+                status["restored"] = True
         except Exception as e:  # Neon unreachable → keep whatever local we have
-            _backup_status["last_error"] = f"restore failed: {e}"
+            status["last_error"] = f"restore failed: {e}"
 
     _seed_defaults(local)
-    _inited = True
+
     if neon is not None:
-        _start_mirror_worker()
+        sh = _shared()
+        threading.Thread(
+            target=_mirror_worker, args=(sh, local, neon),
+            name="plugpix-mirror", daemon=True,
+        ).start()
+    return True
+
+
+def init_db() -> None:
+    _bootstrap()
 
 
 # ---- backup / mirror (SQLite → Neon) -------------------------------------- #
-
-_mirror_event = threading.Event()   # a change happened → mirror soon
-_mirror_dirty = threading.Event()   # local has changes not yet safely in Neon
-_mirror_thread_started = False
-_RETRY_INTERVAL = 120               # seconds; only used to retry a failed mirror
 
 
 def mirror_to_neon() -> bool:
@@ -266,44 +284,47 @@ def mirror_to_neon() -> bool:
     neon = get_neon_engine()
     if neon is None:
         return False
+    sh = _shared()
     try:
         _metadata.create_all(neon)
         _copy_all(src=get_engine(), dst=neon)
-        _backup_status["last_ok"] = now()
-        _backup_status["last_error"] = None
-        _mirror_dirty.clear()
+        sh["status"]["last_ok"] = now()
+        sh["status"]["last_error"] = None
+        sh["dirty"].clear()
         return True
     except Exception as e:
-        _backup_status["last_error"] = str(e)
+        sh["status"]["last_error"] = str(e)
         return False
 
 
-def _mirror_worker() -> None:
+def _mirror_worker(sh: dict, local: Engine, neon: Engine) -> None:
+    # Uses only the objects passed in — never touches st.cache_resource from this
+    # background thread.
+    event_, dirty, status = sh["event"], sh["dirty"], sh["status"]
     while True:
-        # Wake immediately on a change, else every _RETRY_INTERVAL to retry a
-        # pending (failed) mirror. When nothing is dirty, the wake is a no-op.
-        _mirror_event.wait(timeout=_RETRY_INTERVAL)
-        _mirror_event.clear()
-        if not _mirror_dirty.is_set():
+        # Wake on a change, else every _RETRY_INTERVAL to retry a pending mirror.
+        event_.wait(timeout=_RETRY_INTERVAL)
+        event_.clear()
+        if not dirty.is_set():
             continue
         time.sleep(2)  # debounce: coalesce a burst of quick changes
-        _mirror_event.clear()
-        mirror_to_neon()
-
-
-def _start_mirror_worker() -> None:
-    global _mirror_thread_started
-    if _mirror_thread_started:
-        return
-    threading.Thread(target=_mirror_worker, name="plugpix-mirror", daemon=True).start()
-    _mirror_thread_started = True
+        event_.clear()
+        try:
+            _metadata.create_all(neon)
+            _copy_all(src=local, dst=neon)
+            status["last_ok"] = now()
+            status["last_error"] = None
+            dirty.clear()
+        except Exception as e:
+            status["last_error"] = str(e)
 
 
 def request_backup() -> None:
     """Mark data changed and wake the worker to mirror to Neon (non-blocking)."""
     if get_neon_engine() is not None:
-        _mirror_dirty.set()
-        _mirror_event.set()
+        sh = _shared()
+        sh["dirty"].set()
+        sh["event"].set()
 
 
 def now() -> dt.datetime:
@@ -927,9 +948,10 @@ def main() -> None:
     if st.query_params.get("debug"):
         bkp = "off"
         if get_neon_engine() is not None:
-            last = _backup_status["last_ok"]
+            status = backup_status()
+            last = status["last_ok"]
             bkp = f"ok@{fmt_time(last)}" if last else "pending"
-            if _backup_status["last_error"]:
+            if status["last_error"]:
                 bkp = "ERROR"
         st.caption(f"⏱ local load_board={_load_ms:.0f} ms · neon backup={bkp}")
 
