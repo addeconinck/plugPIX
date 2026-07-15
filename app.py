@@ -9,6 +9,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -207,7 +208,9 @@ def _all(stmt) -> list[dict]:
 
 def _exec(stmt) -> int:
     with get_engine().begin() as conn:
-        return conn.execute(stmt).rowcount
+        rc = conn.execute(stmt).rowcount
+    _bust_board_cache()  # any write invalidates the cached board snapshot
+    return rc
 
 
 # ---- live status ---------------------------------------------------------- #
@@ -335,6 +338,7 @@ def add_point(name: str) -> None:
             select(func.coalesce(func.max(points.c.position), -1) + 1)
         ).scalar()
         conn.execute(insert(points).values(name=name.strip(), position=pos))
+    _bust_board_cache()
 
 
 def rename_point(point_id: int, name: str) -> None:
@@ -361,6 +365,7 @@ def set_setting(key: str, value: str) -> None:
         ).rowcount
         if not updated:
             conn.execute(insert(settings).values(key=key, value=value))
+    _bust_board_cache()
 
 
 # ---- bulk board load (one connection, a few queries) ---------------------- #
@@ -406,6 +411,24 @@ def load_board() -> dict:
         "claims": claims,
         "bookings_by_point": bookings_by_point,
     }
+
+
+# Cache the batched snapshot for a few seconds so that non-write interactions
+# (opening a popover, dragging a slider, picking a name) and rapid reruns skip
+# the database entirely. Every write busts it via _bust_board_cache().
+BOARD_CACHE_TTL = 15  # seconds
+
+
+@st.cache_data(ttl=BOARD_CACHE_TTL, show_spinner=False)
+def load_board_cached(cache_key: str) -> dict:
+    return load_board()
+
+
+def _bust_board_cache() -> None:
+    try:
+        load_board_cached.clear()
+    except Exception:
+        pass
 
 
 def active_booking_of(upcoming: list[dict], now_iso: str) -> dict | None:
@@ -754,8 +777,10 @@ def main() -> None:
     st.markdown(MOBILE_CSS, unsafe_allow_html=True)
     init_db()
 
-    # One batched load per rerun instead of dozens of per-point queries.
-    board = load_board()
+    # One batched, briefly-cached load per rerun instead of dozens of queries.
+    _t0 = time.perf_counter()
+    board = load_board_cached(_db_url())
+    _load_ms = (time.perf_counter() - _t0) * 1000.0
     s = board["settings"]
     points = board["points"]
     people = board["people"]
@@ -788,6 +813,10 @@ def main() -> None:
         f"🕐 {n.strftime('%A %d %B %Y — %H:%M:%S')} "
         f"· auto-refreshes every {refresh}s"
     )
+    # Add ?debug=1 to the URL to see where time goes (DB backend + load time).
+    if st.query_params.get("debug"):
+        backend = "postgres" if _db_url().startswith("postgres") else "sqlite"
+        st.caption(f"⏱ backend={backend} · load_board={_load_ms:.0f} ms")
 
     # "Alert me when any point frees up" — notify each time a point newly frees.
     if st.session_state.get("watch_any"):
