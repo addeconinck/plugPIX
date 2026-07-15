@@ -10,14 +10,17 @@ slot for later. Built to be shared with employees over a browser link.
 
 - **Live status** — each charge point shows 🟢 *Free* or 🔴 *In use*, by whom,
   and roughly when it will free up.
-- **Claim / release** — pick your name, claim a point, and drag a slider to say
-  when you'll be done (up to a configurable max). Release it when you unplug.
-- **Booking** — reserve a time slot for **today** using a draggable time-range
-  slider. Overlapping bookings are rejected. A point automatically shows as
-  *In use* once its booked slot starts. (Can be disabled by an admin.)
-- **"Alert me when any point frees up"** — a sidebar toggle that fires a browser
+- **Claim / release** — pick your name, claim a point, and pick how long you'll
+  need it (up to a configurable max). Release it when you unplug. A **free** point
+  is just claimed — no booking involved.
+- **"Book next slot" (waiting list)** — you can only queue for a point that is
+  **in use right now**; pick how long you'll need it and you join the line
+  (FIFO). The card shows the waiting list with each person's duration. When the
+  point frees, the person at the **front of the line is alerted** ("your turn").
+  It never blocks anyone — whoever plugs in first still gets it. (Admin-toggleable.)
+- **"Alert me when any point frees up"** — a toggle that fires a browser
   notification + beep the moment a point becomes free. The tab must stay open.
-- **Mobile-friendly** — big tap targets, drag-based pickers, no iOS zoom-on-focus.
+- **Mobile-friendly** — big tap targets, no iOS zoom-on-focus.
 - **People management** — add employees with a name and a Belgian-style plate
   (`1-ABC-123`), shown next to their name.
 - **Admin page** — password-protected settings (see below).
@@ -59,11 +62,11 @@ only.
 - **Default password: `admin`** — change it on first login
   (Admin → *Change admin password*).
 - From the admin page you can:
-  - enable/disable the **booking** feature,
-  - **add / rename / remove** charge points,
-  - set the **auto-refresh interval**, **max claim duration**, and the
-    **booking window** (earliest/latest hour),
-  - run maintenance: **release all** points, **clear all** bookings.
+  - enable/disable the **waiting list** ("book next slot") feature,
+  - **add / rename / remove** charge points and people,
+  - set the **auto-refresh interval** and **max duration**,
+  - back up to Neon on demand, and run maintenance: **release all** points,
+    **clear all** waiting lists.
 
 The password is stored as a SHA-256 hash in the database — not in plaintext.
 

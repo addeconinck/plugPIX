@@ -54,11 +54,9 @@ def _hash_pw(pw: str) -> str:
 
 # App settings, editable from the Admin page. Values are stored as text.
 DEFAULT_SETTINGS: dict[str, str] = {
-    "booking_enabled": "1",         # "1"/"0" — show the booking feature
+    "booking_enabled": "1",         # "1"/"0" — enable the "take next slot" waiting list
     "refresh_seconds": "30",        # board auto-refresh cadence
-    "max_claim_hours": "8",         # upper bound of the "I'll be done in…" slider
-    "slot_start_hour": "6",         # earliest bookable hour
-    "slot_end_hour": "22",          # latest bookable hour
+    "max_claim_hours": "8",         # upper bound of the duration sliders
     "admin_password": _hash_pw("admin"),
 }
 
@@ -90,13 +88,15 @@ live = Table(
     Column("release_eta", Text),
     Column("released_at", Text),
 )
-bookings = Table(
-    "bookings", _metadata,
+# The waiting list ("take next slot"): people queued for a point that is in use
+# right now. FIFO by created_at. Front of the queue is alerted when it frees.
+queue = Table(
+    "queue", _metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("point", Text, nullable=False),
     Column("person", Text, nullable=False),
-    Column("start_at", Text, nullable=False),
-    Column("end_at", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
+    Column("minutes", Integer),  # how long they'll need it (None = not sure)
 )
 people = Table(
     "people", _metadata,
@@ -123,7 +123,7 @@ settings = Table(
 # button on the Admin page).
 LOCAL_URL = f"sqlite:///{DB_PATH}"
 
-_TABLES = [live, bookings, people, points, settings]
+_TABLES = [live, queue, people, points, settings]
 
 
 def _neon_url() -> str | None:
@@ -375,14 +375,18 @@ def active_claim(point: str) -> dict | None:
 
 
 def claim_point(point: str, person: str, release_eta: dt.datetime | None) -> None:
-    _exec(
-        insert(live).values(
-            point=point,
-            person=person,
-            claimed_at=iso(now()),
-            release_eta=iso(release_eta) if release_eta else None,
+    with get_engine().begin() as conn:
+        conn.execute(
+            insert(live).values(
+                point=point,
+                person=person,
+                claimed_at=iso(now()),
+                release_eta=iso(release_eta) if release_eta else None,
+            )
         )
-    )
+        # Claiming a point removes you from its waiting list.
+        conn.execute(delete(queue).where(queue.c.point == point, queue.c.person == person))
+    request_backup()
 
 
 def release_point(claim_id: int) -> None:
@@ -393,59 +397,37 @@ def release_point(claim_id: int) -> None:
     )
 
 
-# ---- bookings ------------------------------------------------------------- #
-
-
-def upcoming_bookings(point: str) -> list[dict]:
-    return _all(
-        select(bookings)
-        .where(bookings.c.point == point, bookings.c.end_at >= iso(now()))
-        .order_by(bookings.c.start_at)
-    )
-
-
-def active_booking(point: str) -> dict | None:
-    """The booking whose slot covers 'now', if any (start <= now < end)."""
-    return _one(
-        select(bookings)
-        .where(
-            bookings.c.point == point,
-            bookings.c.start_at <= iso(now()),
-            bookings.c.end_at > iso(now()),
-        )
-        .order_by(bookings.c.start_at)
-        .limit(1)
-    )
-
-
 def is_free(point: str) -> bool:
-    """A point is free when nobody is charging now and no booking covers now."""
-    return active_claim(point) is None and active_booking(point) is None
+    """A point is free when nobody is charging on it right now."""
+    return active_claim(point) is None
 
 
-def booking_conflict(point: str, start: dt.datetime, end: dt.datetime) -> dict | None:
-    """Return an overlapping booking on the same point, if any."""
-    return _one(
-        select(bookings)
-        .where(
-            bookings.c.point == point,
-            bookings.c.start_at < iso(end),
-            bookings.c.end_at > iso(start),
-        )
-        .limit(1)
-    )
+# ---- waiting list ("take next slot") -------------------------------------- #
 
 
-def add_booking(point: str, person: str, start: dt.datetime, end: dt.datetime) -> None:
-    _exec(
-        insert(bookings).values(
-            point=point, person=person, start_at=iso(start), end_at=iso(end)
-        )
-    )
+def queue_for(point: str) -> list[dict]:
+    return _all(select(queue).where(queue.c.point == point).order_by(queue.c.created_at))
 
 
-def cancel_booking(booking_id: int) -> None:
-    _exec(delete(bookings).where(bookings.c.id == booking_id))
+def join_queue(point: str, person: str, minutes: int | None) -> None:
+    """Add `person` to the point's waiting list (updates duration if already queued)."""
+    with get_engine().begin() as conn:
+        row = conn.execute(
+            select(queue.c.id).where(queue.c.point == point, queue.c.person == person)
+        ).first()
+        if row:
+            conn.execute(update(queue).where(queue.c.id == row[0]).values(minutes=minutes))
+        else:
+            conn.execute(
+                insert(queue).values(
+                    point=point, person=person, created_at=iso(now()), minutes=minutes
+                )
+            )
+    request_backup()
+
+
+def leave_queue(point: str, person: str) -> None:
+    _exec(delete(queue).where(queue.c.point == point, queue.c.person == person))
 
 
 # ---- people --------------------------------------------------------------- #
@@ -523,9 +505,9 @@ def set_setting(key: str, value: str) -> None:
 def load_board() -> dict:
     """Fetch everything the board needs in ONE connection.
 
-    The per-point helpers (active_claim/active_booking/upcoming_bookings) each
-    make a separate round-trip; on a remote database that's dozens of trips per
-    rerun. This does it in ~5 queries and lets the UI compute status in Python.
+    Doing this in one connection (~5 queries) instead of per-point helpers
+    avoids dozens of round-trips per rerun and lets the UI compute status in
+    Python.
     """
     now_iso = iso(now())
     with get_engine().connect() as conn:
@@ -534,10 +516,8 @@ def load_board() -> dict:
             .where(live.c.released_at.is_(None))
             .order_by(live.c.claimed_at.desc())
         ).mappings().all()
-        bk_rows = conn.execute(
-            select(bookings)
-            .where(bookings.c.end_at >= now_iso)
-            .order_by(bookings.c.start_at)
+        q_rows = conn.execute(
+            select(queue).order_by(queue.c.created_at)
         ).mappings().all()
         pt_rows = conn.execute(
             select(points).order_by(points.c.position, points.c.id)
@@ -548,9 +528,9 @@ def load_board() -> dict:
     claims: dict[str, dict] = {}
     for r in claim_rows:
         claims.setdefault(r["point"], dict(r))  # latest active claim per point
-    bookings_by_point: dict[str, list[dict]] = {}
-    for b in bk_rows:
-        bookings_by_point.setdefault(b["point"], []).append(dict(b))
+    queue_by_point: dict[str, list[dict]] = {}
+    for r in q_rows:
+        queue_by_point.setdefault(r["point"], []).append(dict(r))
 
     return {
         "now_iso": now_iso,
@@ -558,16 +538,8 @@ def load_board() -> dict:
         "points": [r["name"] for r in pt_rows],
         "people": [dict(r) for r in ppl_rows],
         "claims": claims,
-        "bookings_by_point": bookings_by_point,
+        "queue_by_point": queue_by_point,
     }
-
-
-def active_booking_of(upcoming: list[dict], now_iso: str) -> dict | None:
-    """The booking whose slot covers now, from a point's upcoming list."""
-    for b in upcoming:
-        if b["start_at"] <= now_iso < b["end_at"]:
-            return b
-    return None
 
 
 def _setting_int(s: dict, key: str, default: int, lo: int, hi: int) -> int:
@@ -577,12 +549,15 @@ def _setting_int(s: dict, key: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
-def slot_bounds_from(s: dict) -> tuple[dt.time, dt.time]:
-    lo = _setting_int(s, "slot_start_hour", 6, 0, 24)
-    hi = _setting_int(s, "slot_end_hour", 22, 0, 24)
-    if hi <= lo:
-        lo, hi = 6, 22
-    return dt.time(lo, 0), dt.time(min(hi, 23), 59 if hi >= 24 else 0)
+def minutes_label(mins: int | None) -> str:
+    if not mins:
+        return "not sure"
+    h, m = divmod(mins, 60)
+    if h and m:
+        return f"{h} h {m:02d}"
+    if h:
+        return f"{h} h"
+    return f"{m} min"
 
 
 def booking_enabled() -> bool:
@@ -603,19 +578,6 @@ def max_claim_hours() -> int:
         return 8
 
 
-def slot_bounds() -> tuple[dt.time, dt.time]:
-    def hour(key: str, fallback: int) -> int:
-        try:
-            return min(24, max(0, int(get_setting(key, str(fallback)))))
-        except ValueError:
-            return fallback
-    lo = hour("slot_start_hour", 6)
-    hi = hour("slot_end_hour", 22)
-    if hi <= lo:
-        lo, hi = 6, 22
-    return dt.time(lo, 0), dt.time(min(hi, 23), 59 if hi >= 24 else 0)
-
-
 def check_admin_password(pw: str) -> bool:
     return _hash_pw(pw) == get_setting("admin_password", _hash_pw("admin"))
 
@@ -634,9 +596,9 @@ def release_all_points() -> int:
     )
 
 
-def clear_all_bookings() -> int:
-    """Delete all bookings. Returns how many were removed."""
-    return _exec(delete(bookings))
+def clear_all_queue() -> int:
+    """Empty every point's waiting list. Returns how many entries were removed."""
+    return _exec(delete(queue))
 
 
 # --------------------------------------------------------------------------- #
@@ -664,6 +626,17 @@ input, textarea, select { font-size: 16px !important; }
     .block-container { padding: 0.75rem 0.6rem 3rem; }
     h1 { font-size: 1.5rem; }
 }
+/* Timeline segment: let its ✕ overlay sit inside the coloured box (top-right) */
+[class*="st-key-seg-"] { position: relative; }
+[class*="st-key-qx-"] {
+    position: absolute; top: 3px; right: 3px; width: 22px; margin: 0 !important; z-index: 5;
+}
+[class*="st-key-qx-"] button {
+    min-height: 0 !important; height: 20px !important; width: 22px !important;
+    padding: 0 !important; line-height: 1; border-radius: 6px;
+    background: rgba(0,0,0,0.30); color: #fff; border: none;
+}
+[class*="st-key-qx-"] button:hover { background: rgba(0,0,0,0.55); color: #fff; }
 </style>
 """
 
@@ -720,39 +693,88 @@ def fmt_time(d: dt.datetime) -> str:
     return d.astimezone(TIMEZONE).strftime("%H:%M")
 
 
-def default_slot(is_today: bool, slot_min: dt.time, slot_max: dt.time) -> tuple[dt.time, dt.time]:
-    """Default (start, end) for the booking slider — 'now' rounded up if today."""
-    if not is_today:
-        start = slot_min
-        end = (dt.datetime.combine(now().date(), slot_min) + dt.timedelta(hours=1)).time()
-        return start, min(end, slot_max)
-    n = now().replace(second=0, microsecond=0)
-    rounded = n + dt.timedelta(minutes=(15 - n.minute % 15) % 15)  # up to next quarter
-    lo = dt.datetime.combine(n.date(), slot_min, tzinfo=TIMEZONE)
-    # leave room for a 1 h slot before the max
-    hi = dt.datetime.combine(n.date(), slot_max, tzinfo=TIMEZONE) - dt.timedelta(hours=1)
-    start = min(max(rounded, lo), hi)
-    end = min(start + dt.timedelta(hours=1),
-              dt.datetime.combine(n.date(), slot_max, tzinfo=TIMEZONE))
-    return start.time(), end.time()
+# Timeline colours: muted grey for the current in-use block; the validated
+# categorical palette (fixed order) for each person waiting in line.
+_TL_BUSY = "#8a8a8a"
+_TL_COLORS = [
+    "#2a78d6", "#1baf7a", "#eda100", "#008300",
+    "#4a3aa7", "#e34948", "#e87ba4", "#eb6834",
+]
+_DEFAULT_MIN = 60  # assumed duration when someone didn't say ("not sure")
 
 
-def fmt_day_time(d: dt.datetime) -> str:
-    d = d.astimezone(TIMEZONE)
-    today = now().date()
-    if d.date() == today:
-        return d.strftime("%H:%M")
-    if d.date() == today + dt.timedelta(days=1):
-        return "tomorrow " + d.strftime("%H:%M")
-    return d.strftime("%a %d %b %H:%M")
+def schedule_segments(claim: dict | None, wait_list: list[dict]) -> list[dict]:
+    """Estimated back-to-back schedule: the current use, then each queued person."""
+    n = now()
+    segs: list[dict] = []
+    cursor = n
+    if claim is not None:
+        end = parse(claim["release_eta"])
+        known = bool(end and end > n)
+        occ_end = end if known else n + dt.timedelta(minutes=_DEFAULT_MIN)
+        segs.append({
+            "person": claim["person"], "start": n, "end": occ_end,
+            "minutes": max(1, (occ_end - n).total_seconds() / 60),
+            "kind": "busy", "approx": not known, "booked": None,
+            "color": _TL_BUSY, "id": None,
+        })
+        cursor = occ_end
+    for idx, q in enumerate(wait_list):
+        m = q["minutes"] or _DEFAULT_MIN
+        start = cursor
+        end = start + dt.timedelta(minutes=m)
+        segs.append({
+            "person": q["person"], "start": start, "end": end, "minutes": m,
+            "kind": "queue", "approx": q["minutes"] is None, "booked": q["minutes"],
+            "color": _TL_COLORS[idx % len(_TL_COLORS)], "id": q["id"],
+        })
+        cursor = end
+    return segs
+
+
+def _esc(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _text_on(hex_color: str) -> str:
+    """Pick black or white text for best contrast on the given fill colour."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    lin = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    lum = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    contrast_white = 1.05 / (lum + 0.05)
+    contrast_black = (lum + 0.05) / 0.05
+    return "#ffffff" if contrast_white >= contrast_black else "#000000"
+
+
+def segment_box_html(sg: dict, me: str | None) -> str:
+    """One timeline segment: a colored box with the person's name and start–end."""
+    txt = _text_on(sg["color"])
+    is_me = sg["person"] == me
+    name = "you" if is_me else sg["person"]
+    ring = "box-shadow:inset 0 0 0 2px rgba(255,255,255,0.9);" if is_me else ""
+    # Leave room for the overlaid ✕ on your own queued segment.
+    pad = "4px 24px 4px 6px" if (is_me and sg["kind"] == "queue") else "4px 6px"
+    approx = "~" if sg["approx"] else ""
+    interval = f'{approx}{fmt_time(sg["start"])}–{fmt_time(sg["end"])}'
+    return (
+        f'<div title="{_esc(name)} · {interval}" style="background:{sg["color"]};'
+        f'color:{txt};border-radius:6px;padding:{pad};{ring}text-align:center;'
+        f'overflow:hidden;box-sizing:border-box;">'
+        f'<div style="font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis;">{_esc(name)}</div>'
+        f'<div style="font-size:10px;opacity:.9;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis;">{interval}</div></div>'
+    )
 
 
 def render_point(point: str, me: str | None, booking_on: bool,
                  eta_choices: dict[str, int | None], claim: dict | None,
-                 booking_now: dict | None, upcoming: list[dict],
-                 slot_min: dt.time, slot_max: dt.time) -> None:
-    in_use = claim is not None or booking_now is not None
-    bookings = upcoming
+                 wait_list: list[dict]) -> None:
+    in_use = claim is not None
+    can_act = me is not None
+    my_entry = next((q for q in wait_list if q["person"] == me), None)
 
     with st.container(border=True):
         header = st.columns([3, 2])
@@ -760,7 +782,7 @@ def render_point(point: str, me: str | None, booking_on: bool,
             if not in_use:
                 st.markdown(f"### 🟢 {point}")
                 st.caption("Free now")
-            elif claim is not None:
+            else:
                 st.markdown(f"### 🔴 {point}")
                 eta = parse(claim["release_eta"])
                 who = "you" if claim["person"] == me else claim["person"]
@@ -768,33 +790,21 @@ def render_point(point: str, me: str | None, booking_on: bool,
                     st.caption(f"In use by **{who}** — free ~{fmt_time(eta)}")
                 else:
                     st.caption(f"In use by **{who}**")
-            else:  # covered by an active booking
-                st.markdown(f"### 🔴 {point}")
-                who = "you" if booking_now["person"] == me else booking_now["person"]
-                st.caption(
-                    f"Booked by **{who}** — free ~{fmt_time(parse(booking_now['end_at']))}"
-                )
 
-        can_act = me is not None
         with header[1]:
             if not in_use:
+                # Free → just claim it (no booking on a free point).
                 if not can_act:
-                    st.button(
-                        "⚡ Claim now",
-                        key=f"claim-btn-{point}",
-                        use_container_width=True,
-                        disabled=True,
-                        help="Select your name first.",
-                    )
+                    st.button("⚡ Claim now", key=f"claim-btn-{point}",
+                              use_container_width=True, disabled=True,
+                              help="Select your name first.")
                 else:
                     with st.popover("⚡ Claim now", use_container_width=True):
                         st.write(f"Claim **{point}** for **{me}**")
+                        default = _eta_label_for(eta_choices, my_entry)
                         choice = st.select_slider(
-                            "I'll be done in…",
-                            options=list(eta_choices),
-                            value="1 h",
-                            key=f"eta-{point}",
-                        )
+                            "I'll be done in…", options=list(eta_choices),
+                            value=default, key=f"eta-{point}")
                         mins = eta_choices[choice]
                         eta_dt = now() + dt.timedelta(minutes=mins) if mins else None
                         if eta_dt:
@@ -802,95 +812,60 @@ def render_point(point: str, me: str | None, booking_on: bool,
                         if st.button("Confirm claim", key=f"claim-{point}", type="primary"):
                             claim_point(point, me, eta_dt)
                             st.rerun()
-            elif claim is not None:
+            else:
+                # In use → owner can release; others can queue for the next slot.
                 if claim["person"] == me:
-                    if st.button(
-                        "✅ Release", key=f"rel-{point}", use_container_width=True
-                    ):
+                    if st.button("✅ Release", key=f"rel-{point}", use_container_width=True):
                         release_point(claim["id"])
                         st.rerun()
-                else:
-                    st.button(
-                        "Release",
-                        key=f"rel-{point}",
-                        use_container_width=True,
-                        disabled=True,
-                        help=f"Only {claim['person']} can release this.",
-                    )
-            else:  # in use because of an active booking
-                owner = booking_now["person"]
-                if owner == me:
-                    if st.button(
-                        "✅ End early", key=f"rel-{point}", use_container_width=True
-                    ):
-                        cancel_booking(booking_now["id"])
+                elif not booking_on:
+                    st.button("Release", key=f"rel-{point}", use_container_width=True,
+                              disabled=True, help=f"Only {claim['person']} can release this.")
+                elif not can_act:
+                    st.button("🎟️ Book next slot", key=f"book-btn-{point}",
+                              use_container_width=True, disabled=True,
+                              help="Select your name first.")
+                elif my_entry is not None:
+                    if st.button("🎟️ Leave the line", key=f"leave-{point}",
+                                 use_container_width=True):
+                        leave_queue(point, me)
                         st.rerun()
                 else:
-                    st.button(
-                        "Release",
-                        key=f"rel-{point}",
-                        use_container_width=True,
-                        disabled=True,
-                        help=f"Booked by {owner}.",
-                    )
+                    with st.popover("🎟️ Book next slot", use_container_width=True):
+                        st.write(f"Get in line for **{point}** — **{me}**")
+                        choice = st.select_slider(
+                            "I'll need it for…", options=list(eta_choices),
+                            value="1 h", key=f"q-{point}")
+                        if st.button("Join the line", key=f"join-{point}", type="primary"):
+                            join_queue(point, me, eta_choices[choice])
+                            st.rerun()
 
-        # Bookings
-        if bookings:
-            st.markdown("**Upcoming bookings**")
-            for b in bookings:
-                cols = st.columns([5, 1])
-                start, end = parse(b["start_at"]), parse(b["end_at"])
-                mine = b["person"] == me
-                label = "**you**" if mine else b["person"]
-                cols[0].write(
-                    f"• {fmt_day_time(start)} – {fmt_time(end)} — {label}"
-                )
-                if mine:
-                    if cols[1].button("✕", key=f"cancel-{b['id']}", help="Cancel"):
-                        cancel_booking(b["id"])
-                        st.rerun()
+        # Timeline: a Gantt-style row — current use, then each person in line, with
+        # start–end on every segment and a ✕ on your own to leave the line.
+        if booking_on and (in_use or wait_list):
+            segs = schedule_segments(claim, wait_list)
+            total = sum(sg["minutes"] for sg in segs) or 1
+            # Floor each width so a short slot still fits its label and the ✕.
+            weights = [max(sg["minutes"], total * 0.14) for sg in segs]
+            cols = st.columns(weights, gap="small")
+            pslug = re.sub(r"\W+", "_", point)
+            for idx, (col, sg) in enumerate(zip(cols, segs)):
+                with col.container(key=f"seg-{pslug}-{idx}"):
+                    st.markdown(segment_box_html(sg, me), unsafe_allow_html=True)
+                    if sg["kind"] == "queue" and sg["person"] == me:
+                        # CSS overlays this ✕ into the segment's top-right corner.
+                        if st.button("✕", key=f"qx-{sg['id']}", help="Leave the line"):
+                            leave_queue(point, me)
+                            st.rerun()
 
-        if not booking_on:
-            return
-        if not can_act:
-            st.button(
-                "📅 Book a slot today",
-                key=f"book-btn-{point}",
-                use_container_width=True,
-                disabled=True,
-                help="Select your name first.",
-            )
-            return
-        with st.popover("📅 Book a slot today", use_container_width=True):
-            st.write(f"Book **{point}** for **{me}** — today only")
-            day = now().date()
-            start_t, end_t = st.slider(
-                "Drag to set the time slot",
-                min_value=slot_min,
-                max_value=slot_max,
-                value=default_slot(True, slot_min, slot_max),
-                step=dt.timedelta(minutes=15),
-                format="HH:mm",
-                key=f"bslot-{point}",
-            )
-            if st.button("Add booking", key=f"addbook-{point}", type="primary"):
-                start = dt.datetime.combine(day, start_t, tzinfo=TIMEZONE)
-                end = dt.datetime.combine(day, end_t, tzinfo=TIMEZONE)
-                if end <= start:
-                    st.error("End time must be after start time.")
-                elif end <= now():
-                    st.error("That slot is in the past.")
-                else:
-                    conflict = booking_conflict(point, start, end)
-                    if conflict:
-                        st.error(
-                            f"Overlaps with {conflict['person']}'s booking "
-                            f"({fmt_time(parse(conflict['start_at']))}–"
-                            f"{fmt_time(parse(conflict['end_at']))})."
-                        )
-                    else:
-                        add_booking(point, me, start, end)
-                        st.rerun()
+
+def _eta_label_for(eta_choices: dict[str, int | None], my_entry: dict | None) -> str:
+    """Pre-select the duration a queued person booked, when they finally claim."""
+    if my_entry and my_entry.get("minutes"):
+        for label, mins in eta_choices.items():
+            if mins == my_entry["minutes"]:
+                return label
+    return "1 h"
 
 
 # --------------------------------------------------------------------------- #
@@ -916,24 +891,14 @@ def main() -> None:
     points = board["points"]
     people = board["people"]
     claims = board["claims"]
-    bookings_by_point = board["bookings_by_point"]
-    now_iso = board["now_iso"]
+    queue_by_point = board["queue_by_point"]
 
     booking_on = s.get("booking_enabled", "1") == "1"
     refresh = _setting_int(s, "refresh_seconds", 30, 5, 3600)
     eta_choices = build_eta_choices(_setting_int(s, "max_claim_hours", 8, 1, 24))
-    slot_min, slot_max = slot_bounds_from(s)
 
-    # Per-point state, computed in Python from the batched snapshot.
-    states: dict[str, tuple] = {}
-    free_now: set[str] = set()
-    for p in points:
-        claim = claims.get(p)
-        upcoming = bookings_by_point.get(p, [])
-        booking_now = active_booking_of(upcoming, now_iso) if claim is None else None
-        states[p] = (claim, booking_now, upcoming)
-        if claim is None and booking_now is None:
-            free_now.add(p)
+    # Per-point state from the batched snapshot.
+    free_now = {p for p in points if claims.get(p) is None}
 
     # Auto-refresh the whole board (keeps session/state, unlike a browser reload).
     st_autorefresh(interval=refresh * 1000, key="autorefresh")
@@ -1019,6 +984,27 @@ def main() -> None:
     else:
         st.info("👆 Select your name (or add yourself) to claim or book a charge point.")
 
+    # --- "It's your turn" — you're first in line and the point just freed ---
+    your_turn = []
+    if me and booking_on:
+        for p in points:
+            q = queue_by_point.get(p, [])
+            if claims.get(p) is None and q and q[0]["person"] == me:
+                your_turn.append(p)
+    if your_turn:
+        st.success(
+            "🎟️ **Your turn:** " + ", ".join(your_turn)
+            + " — claim it before someone else does!"
+        )
+    prev_turn = st.session_state.get("turn_prev", set())
+    newly_turn = set(your_turn) - prev_turn
+    st.session_state["turn_prev"] = set(your_turn)
+    for p in sorted(newly_turn):
+        st.toast(f"🎟️ {p} is free — you're up!", icon="🎟️")
+    if newly_turn:
+        fire_browser_notification([f"{p} — your turn" for p in sorted(newly_turn)])
+        request_notify_permission()
+
     # --- Controls ---
     c1, c2 = st.columns([1, 1])
     c1.metric("Free right now", f"{len(free_now)} / {len(points)}")
@@ -1035,11 +1021,10 @@ def main() -> None:
     for i in range(0, len(points), 2):
         cols = st.columns(2)
         for j, point in enumerate(points[i:i + 2]):
-            claim, booking_now, upcoming = states[point]
             with cols[j]:
                 render_point(
                     point, me, booking_on, eta_choices,
-                    claim, booking_now, upcoming, slot_min, slot_max,
+                    claims.get(point), queue_by_point.get(point, []),
                 )
 
 

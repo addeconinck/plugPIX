@@ -48,14 +48,14 @@ def main() -> None:
     # --------------------------------------------------------------- Features
     st.subheader("Features")
     booking_on = st.toggle(
-        "📅 Booking feature enabled",
+        "🎟️ Waiting list (“book next slot”) enabled",
         value=app.booking_enabled(),
-        help="When off, employees can only claim/release live — no time-slot booking.",
+        help="When off, employees can only claim/release — no queueing for in-use points.",
     )
     new_booking = "1" if booking_on else "0"
     if new_booking != app.get_setting("booking_enabled"):
         app.set_setting("booking_enabled", new_booking)
-        st.toast("Booking " + ("enabled" if booking_on else "disabled"))
+        st.toast("Waiting list " + ("enabled" if booking_on else "disabled"))
 
     st.divider()
 
@@ -142,27 +142,14 @@ def main() -> None:
             min_value=5, max_value=600, step=5, value=app.refresh_seconds(),
         )
         max_hours = st.number_input(
-            "Max claim duration on the “I'll be done in…” slider (hours)",
+            "Max duration on the “I'll be done in…” / “I'll need it for…” sliders (hours)",
             min_value=1, max_value=24, step=1, value=app.max_claim_hours(),
-        )
-        lo, hi = app.slot_bounds()
-        c1, c2 = st.columns(2)
-        start_h = c1.number_input(
-            "Booking window — earliest hour", min_value=0, max_value=23, value=lo.hour
-        )
-        end_h = c2.number_input(
-            "Booking window — latest hour", min_value=1, max_value=24, value=hi.hour or 22
         )
         saved = st.form_submit_button("💾 Save settings", type="primary")
     if saved:
-        if end_h <= start_h:
-            st.error("Latest hour must be after earliest hour.")
-        else:
-            app.set_setting("refresh_seconds", str(int(refresh)))
-            app.set_setting("max_claim_hours", str(int(max_hours)))
-            app.set_setting("slot_start_hour", str(int(start_h)))
-            app.set_setting("slot_end_hour", str(int(end_h)))
-            st.success("Settings saved.")
+        app.set_setting("refresh_seconds", str(int(refresh)))
+        app.set_setting("max_claim_hours", str(int(max_hours)))
+        st.success("Settings saved.")
 
     st.divider()
 
@@ -222,9 +209,9 @@ def main() -> None:
     if m1.button("🔌 Release ALL charge points", use_container_width=True):
         freed = app.release_all_points()
         st.success(f"Released {freed} active session(s).")
-    if m2.button("🗑 Clear ALL bookings", use_container_width=True):
-        removed = app.clear_all_bookings()
-        st.success(f"Removed {removed} booking(s).")
+    if m2.button("🗑 Clear ALL waiting lists", use_container_width=True):
+        removed = app.clear_all_queue()
+        st.success(f"Removed {removed} queue entry(ies).")
 
 
 if __name__ == "__main__":
