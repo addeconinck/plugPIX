@@ -9,11 +9,24 @@ import datetime as dt
 import hashlib
 import json
 import re
-import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from sqlalchemy import (
+    Column,
+    Integer,
+    MetaData,
+    Table,
+    Text,
+    create_engine,
+    delete,
+    func,
+    insert,
+    select,
+    update,
+)
+from sqlalchemy.engine import Engine
 from streamlit_autorefresh import st_autorefresh
 
 # --------------------------------------------------------------------------- #
@@ -60,87 +73,108 @@ def normalize_plate(raw: str) -> str | None:
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
 # --------------------------------------------------------------------------- #
-# Storage
+# Storage  (SQLAlchemy — Postgres in production, local SQLite as a fallback)
 # --------------------------------------------------------------------------- #
 
+_metadata = MetaData()
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+live = Table(
+    "live", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("point", Text, nullable=False),
+    Column("person", Text, nullable=False),
+    Column("claimed_at", Text, nullable=False),
+    Column("release_eta", Text),
+    Column("released_at", Text),
+)
+bookings = Table(
+    "bookings", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("point", Text, nullable=False),
+    Column("person", Text, nullable=False),
+    Column("start_at", Text, nullable=False),
+    Column("end_at", Text, nullable=False),
+)
+people = Table(
+    "people", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", Text, nullable=False, unique=True),
+    Column("plate", Text, nullable=False, server_default=""),
+)
+points = Table(
+    "points", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", Text, nullable=False, unique=True),
+    Column("position", Integer, nullable=False, server_default="0"),
+)
+settings = Table(
+    "settings", _metadata,
+    Column("key", Text, primary_key=True),
+    Column("value", Text),
+)
+
+
+def _db_url() -> str:
+    """Connection URL: Streamlit secret in production, local SQLite in dev.
+
+    Set a persistent database on Streamlit Cloud via app Settings → Secrets:
+        [database]
+        url = "postgresql://user:pass@host/dbname?sslmode=require"
+    """
+    try:
+        secrets = st.secrets
+        if "database" in secrets and "url" in secrets["database"]:
+            url = str(secrets["database"]["url"])
+        elif "DB_URL" in secrets:
+            url = str(secrets["DB_URL"])
+        else:
+            url = ""
+    except Exception:
+        url = ""
+    if not url:
+        return f"sqlite:///{DB_PATH}"
+    # SQLAlchemy needs the "postgresql://" scheme, not the older "postgres://".
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+_engines: dict[str, Engine] = {}
+_inited: set[str] = set()
+
+
+def get_engine() -> Engine:
+    url = _db_url()
+    if url not in _engines:
+        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+        _engines[url] = create_engine(
+            url,
+            connect_args=connect_args,
+            pool_pre_ping=True,   # transparently replace connections dropped by the server
+            pool_recycle=300,     # recycle connections older than 5 min (serverless idle)
+        )
+    return _engines[url]
 
 
 def init_db() -> None:
-    with get_conn() as conn:
-        # A live "claim": someone is charging right now on `point`.
-        # released_at IS NULL  => still in use.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS live (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                point         TEXT    NOT NULL,
-                person        TEXT    NOT NULL,
-                claimed_at    TEXT    NOT NULL,
-                release_eta   TEXT,
-                released_at   TEXT
-            )
-            """
-        )
-        # A future booking of a time slot on `point`.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bookings (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                point     TEXT NOT NULL,
-                person    TEXT NOT NULL,
-                start_at  TEXT NOT NULL,
-                end_at    TEXT NOT NULL
-            )
-            """
-        )
-        # The people who may use the app (managed from the sidebar).
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS people (
-                id    INTEGER PRIMARY KEY AUTOINCREMENT,
-                name  TEXT NOT NULL UNIQUE,
-                plate TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        empty = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0] == 0
-        if empty:
+    """Create tables and seed defaults once per process (idempotent)."""
+    url = _db_url()
+    if url in _inited:
+        return
+    engine = get_engine()
+    _metadata.create_all(engine)
+    with engine.begin() as conn:
+        if conn.execute(select(func.count()).select_from(people)).scalar() == 0:
             for name, plate in DEFAULT_PEOPLE:
-                conn.execute(
-                    "INSERT OR IGNORE INTO people (name, plate) VALUES (?, ?)",
-                    (name, plate),
-                )
-        # The charge points (managed from the Admin page).
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS points (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                name     TEXT NOT NULL UNIQUE,
-                position INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        if conn.execute("SELECT COUNT(*) FROM points").fetchone()[0] == 0:
+                conn.execute(insert(people).values(name=name, plate=plate))
+        if conn.execute(select(func.count()).select_from(points)).scalar() == 0:
             for i, name in enumerate(DEFAULT_POINTS):
-                conn.execute(
-                    "INSERT OR IGNORE INTO points (name, position) VALUES (?, ?)",
-                    (name, i),
-                )
-        # Key/value app settings (managed from the Admin page).
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"
-        )
+                conn.execute(insert(points).values(name=name, position=i))
+        have = {r[0] for r in conn.execute(select(settings.c.key))}
         for key, value in DEFAULT_SETTINGS.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                (key, value),
-            )
+            if key not in have:
+                conn.execute(insert(settings).values(key=key, value=value))
+    _inited.add(url)
 
 
 def now() -> dt.datetime:
@@ -160,55 +194,76 @@ def parse(s: str | None) -> dt.datetime | None:
     return d
 
 
+def _one(stmt) -> dict | None:
+    with get_engine().connect() as conn:
+        row = conn.execute(stmt).mappings().first()
+    return dict(row) if row else None
+
+
+def _all(stmt) -> list[dict]:
+    with get_engine().connect() as conn:
+        return [dict(r) for r in conn.execute(stmt).mappings().all()]
+
+
+def _exec(stmt) -> int:
+    with get_engine().begin() as conn:
+        return conn.execute(stmt).rowcount
+
+
 # ---- live status ---------------------------------------------------------- #
 
 
-def active_claim(point: str) -> sqlite3.Row | None:
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM live WHERE point = ? AND released_at IS NULL "
-            "ORDER BY claimed_at DESC LIMIT 1",
-            (point,),
-        ).fetchone()
+def active_claim(point: str) -> dict | None:
+    return _one(
+        select(live)
+        .where(live.c.point == point, live.c.released_at.is_(None))
+        .order_by(live.c.claimed_at.desc())
+        .limit(1)
+    )
 
 
 def claim_point(point: str, person: str, release_eta: dt.datetime | None) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO live (point, person, claimed_at, release_eta) "
-            "VALUES (?, ?, ?, ?)",
-            (point, person, iso(now()), iso(release_eta) if release_eta else None),
+    _exec(
+        insert(live).values(
+            point=point,
+            person=person,
+            claimed_at=iso(now()),
+            release_eta=iso(release_eta) if release_eta else None,
         )
+    )
 
 
 def release_point(claim_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE live SET released_at = ? WHERE id = ? AND released_at IS NULL",
-            (iso(now()), claim_id),
-        )
+    _exec(
+        update(live)
+        .where(live.c.id == claim_id, live.c.released_at.is_(None))
+        .values(released_at=iso(now()))
+    )
 
 
 # ---- bookings ------------------------------------------------------------- #
 
 
-def upcoming_bookings(point: str) -> list[sqlite3.Row]:
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM bookings WHERE point = ? AND end_at >= ? "
-            "ORDER BY start_at",
-            (point, iso(now())),
-        ).fetchall()
+def upcoming_bookings(point: str) -> list[dict]:
+    return _all(
+        select(bookings)
+        .where(bookings.c.point == point, bookings.c.end_at >= iso(now()))
+        .order_by(bookings.c.start_at)
+    )
 
 
-def active_booking(point: str) -> sqlite3.Row | None:
+def active_booking(point: str) -> dict | None:
     """The booking whose slot covers 'now', if any (start <= now < end)."""
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM bookings WHERE point = ? AND start_at <= ? AND end_at > ? "
-            "ORDER BY start_at LIMIT 1",
-            (point, iso(now()), iso(now())),
-        ).fetchone()
+    return _one(
+        select(bookings)
+        .where(
+            bookings.c.point == point,
+            bookings.c.start_at <= iso(now()),
+            bookings.c.end_at > iso(now()),
+        )
+        .order_by(bookings.c.start_at)
+        .limit(1)
+    )
 
 
 def is_free(point: str) -> bool:
@@ -216,63 +271,58 @@ def is_free(point: str) -> bool:
     return active_claim(point) is None and active_booking(point) is None
 
 
-def booking_conflict(point: str, start: dt.datetime, end: dt.datetime) -> sqlite3.Row | None:
+def booking_conflict(point: str, start: dt.datetime, end: dt.datetime) -> dict | None:
     """Return an overlapping booking on the same point, if any."""
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM bookings WHERE point = ? AND start_at < ? AND end_at > ? "
-            "LIMIT 1",
-            (point, iso(end), iso(start)),
-        ).fetchone()
+    return _one(
+        select(bookings)
+        .where(
+            bookings.c.point == point,
+            bookings.c.start_at < iso(end),
+            bookings.c.end_at > iso(start),
+        )
+        .limit(1)
+    )
 
 
 def add_booking(point: str, person: str, start: dt.datetime, end: dt.datetime) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO bookings (point, person, start_at, end_at) VALUES (?, ?, ?, ?)",
-            (point, person, iso(start), iso(end)),
+    _exec(
+        insert(bookings).values(
+            point=point, person=person, start_at=iso(start), end_at=iso(end)
         )
+    )
 
 
 def cancel_booking(booking_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
+    _exec(delete(bookings).where(bookings.c.id == booking_id))
 
 
 # ---- people --------------------------------------------------------------- #
 
 
-def list_people() -> list[sqlite3.Row]:
-    with get_conn() as conn:
-        return conn.execute("SELECT * FROM people ORDER BY name COLLATE NOCASE").fetchall()
+def list_people() -> list[dict]:
+    # Case-insensitive sort done in Python so it's portable across DBs.
+    ppl = _all(select(people))
+    return sorted(ppl, key=lambda p: p["name"].casefold())
 
 
 def add_person(name: str, plate: str) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO people (name, plate) VALUES (?, ?)", (name.strip(), plate)
-        )
+    _exec(insert(people).values(name=name.strip(), plate=plate))
 
 
 def remove_person(person_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM people WHERE id = ?", (person_id,))
+    _exec(delete(people).where(people.c.id == person_id))
 
 
 def plate_of(name: str) -> str:
-    with get_conn() as conn:
-        row = conn.execute("SELECT plate FROM people WHERE name = ?", (name,)).fetchone()
+    row = _one(select(people.c.plate).where(people.c.name == name))
     return row["plate"] if row else ""
 
 
 # ---- points --------------------------------------------------------------- #
 
 
-def list_points() -> list[sqlite3.Row]:
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM points ORDER BY position, id"
-        ).fetchall()
+def list_points() -> list[dict]:
+    return _all(select(points).order_by(points.c.position, points.c.id))
 
 
 def get_points() -> list[str]:
@@ -280,39 +330,37 @@ def get_points() -> list[str]:
 
 
 def add_point(name: str) -> None:
-    with get_conn() as conn:
-        pos = conn.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM points").fetchone()[0]
-        conn.execute(
-            "INSERT INTO points (name, position) VALUES (?, ?)", (name.strip(), pos)
-        )
+    with get_engine().begin() as conn:
+        pos = conn.execute(
+            select(func.coalesce(func.max(points.c.position), -1) + 1)
+        ).scalar()
+        conn.execute(insert(points).values(name=name.strip(), position=pos))
 
 
 def rename_point(point_id: int, name: str) -> None:
-    with get_conn() as conn:
-        conn.execute("UPDATE points SET name = ? WHERE id = ?", (name.strip(), point_id))
+    _exec(update(points).where(points.c.id == point_id).values(name=name.strip()))
 
 
 def remove_point(point_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM points WHERE id = ?", (point_id,))
+    _exec(delete(points).where(points.c.id == point_id))
 
 
 # ---- settings ------------------------------------------------------------- #
 
 
 def get_setting(key: str, default: str = "") -> str:
-    with get_conn() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    row = _one(select(settings.c.value).where(settings.c.key == key))
     return row["value"] if row else default
 
 
 def set_setting(key: str, value: str) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
+    # Portable upsert: try UPDATE, INSERT if the row didn't exist yet.
+    with get_engine().begin() as conn:
+        updated = conn.execute(
+            update(settings).where(settings.c.key == key).values(value=value)
+        ).rowcount
+        if not updated:
+            conn.execute(insert(settings).values(key=key, value=value))
 
 
 def booking_enabled() -> bool:
@@ -359,18 +407,14 @@ def set_admin_password(pw: str) -> None:
 
 def release_all_points() -> int:
     """End every active live claim. Returns how many were released."""
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE live SET released_at = ? WHERE released_at IS NULL", (iso(now()),)
-        )
-        return cur.rowcount
+    return _exec(
+        update(live).where(live.c.released_at.is_(None)).values(released_at=iso(now()))
+    )
 
 
 def clear_all_bookings() -> int:
     """Delete all bookings. Returns how many were removed."""
-    with get_conn() as conn:
-        cur = conn.execute("DELETE FROM bookings")
-        return cur.rowcount
+    return _exec(delete(bookings))
 
 
 # --------------------------------------------------------------------------- #

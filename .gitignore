@@ -6,6 +6,9 @@ venv/
 charging.db
 *.db
 
+# Streamlit secrets (database connection string, etc.) — never commit
+.streamlit/secrets.toml
+
 # Python
 __pycache__/
 *.py[cod]

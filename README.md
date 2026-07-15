@@ -28,7 +28,7 @@ slot for later. Built to be shared with employees over a browser link.
 
 - Python 3.10+
 - Packages in [`requirements.txt`](requirements.txt) (`streamlit`,
-  `streamlit-autorefresh`)
+  `streamlit-autorefresh`, `SQLAlchemy`, `psycopg2-binary`)
 
 ## Setup & run
 
@@ -80,21 +80,60 @@ and settings from the running app rather than editing the code.
 
 ## Data & storage
 
-All runtime state is kept in `charging.db` (SQLite), created automatically next
-to `app.py` on first run. It holds live claims, bookings, people, the charge
-points, and app settings (including the admin password hash).
+All runtime state — live claims, bookings, people, charge points, and settings
+(including the admin password hash) — is stored via **SQLAlchemy**:
 
-> **`charging.db` is git-ignored on purpose** — it is per-deployment runtime
-> state and contains the admin password hash. Don't commit it.
+- **Production / cloud:** a persistent **PostgreSQL** database, configured with a
+  connection string in Streamlit secrets (see below).
+- **Local development:** if no database secret is set, it falls back to a local
+  SQLite file `charging.db` next to `app.py`, created automatically.
+
+> ⚠️ **Do not rely on SQLite on Streamlit Community Cloud (or any sleep/restart
+> host).** Its filesystem is **ephemeral** — the container is wiped when the app
+> sleeps, reboots, or redeploys, so a local `charging.db` is lost (people and
+> bookings disappear overnight). Use a hosted Postgres in production.
+
+> `charging.db` and `.streamlit/secrets.toml` are git-ignored on purpose — they
+> are per-deployment runtime state / secrets. Don't commit them.
+
+### Setting up a persistent database (Postgres)
+
+1. Create a **free** Postgres database — e.g. [Neon](https://neon.tech) or
+   [Supabase](https://supabase.com). Copy its connection string; it looks like:
+
+   ```
+   postgresql://user:password@host/dbname?sslmode=require
+   ```
+
+2. **On Streamlit Community Cloud:** open your app → **⋮ → Settings → Secrets**
+   and paste:
+
+   ```toml
+   [database]
+   url = "postgresql://user:password@host/dbname?sslmode=require"
+   ```
+
+   Save — the app restarts and now reads/writes the Postgres database. Tables
+   and default settings are created automatically on first run.
+
+3. **Locally** (optional, to use the same DB in dev): create
+   `.streamlit/secrets.toml` with the same content. See
+   [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example).
+
+That's it — data now survives restarts. (A `postgres://` prefix is accepted too;
+it's normalized to `postgresql://` automatically.)
 
 ## Deployment
 
 Any host that can run Streamlit works. For a small team:
 
-1. **One always-on machine** — run the command above and share the Network URL.
-2. **[Streamlit Community Cloud](https://streamlit.io/cloud)** — push this repo
-   (without `venv/` and `charging.db`, both git-ignored) and deploy `app.py`.
-   Serves over HTTPS, which browser notifications require off-localhost.
+1. **[Streamlit Community Cloud](https://streamlit.io/cloud)** (recommended) —
+   push this repo (without `venv/`, `charging.db`, and `secrets.toml`, all
+   git-ignored), deploy `app.py`, and **add the `[database]` secret above** so
+   data persists. Serves over HTTPS, which browser notifications require.
+2. **One always-on machine** — run the command above and share the Network URL.
+   Here the SQLite fallback persists fine (the disk isn't wiped), so a database
+   secret is optional.
 
 > Browser notifications only work on a **secure origin** (HTTPS, or
 > `localhost`). On a plain `http://` LAN address they are silently disabled.
@@ -107,8 +146,10 @@ plugPIX/
 ├── pages/
 │   └── 1_Admin.py         # hidden, password-protected admin page
 ├── .streamlit/
-│   └── config.toml        # hides the multipage nav
+│   ├── config.toml            # hides the multipage nav
+│   ├── secrets.toml.example   # template for the DB connection string
+│   └── secrets.toml           # your real secrets (git-ignored; create locally)
 ├── requirements.txt
 ├── .gitignore
-└── charging.db            # created at runtime (git-ignored)
+└── charging.db                # local SQLite fallback, created at runtime (git-ignored)
 ```
