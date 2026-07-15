@@ -183,6 +183,38 @@ def main() -> None:
 
     st.divider()
 
+    # ---------------------------------------------------------------- Backup
+    st.subheader("Backup")
+    if app.get_neon_engine() is None:
+        st.info(
+            "No backup database configured. Data lives only in local SQLite and "
+            "will be lost if this host's storage is wiped. Add a Neon/Postgres "
+            "connection string in Secrets to enable durable backups."
+        )
+    else:
+        status = app._backup_status
+        if status["restored"]:
+            st.caption("↩️ Restored from Neon on startup.")
+        if status["last_ok"]:
+            st.success(f"Last backup: {status['last_ok'].strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            st.caption("No backup yet this session (auto-backups run on every change).")
+        if status["last_error"]:
+            st.error(f"Last backup error: {status['last_error']}")
+        st.caption(
+            "Backups to Neon happen automatically (asynchronously) whenever data "
+            "changes, and retry on failure. Use the button to force one now."
+        )
+        if st.button("💾 Backup now", type="primary", use_container_width=True):
+            with st.spinner("Mirroring to Neon…"):
+                ok = app.mirror_to_neon()
+            if ok:
+                st.success("Backup complete.")
+            else:
+                st.error(f"Backup failed: {app._backup_status['last_error']}")
+
+    st.divider()
+
     # ------------------------------------------------------------ Maintenance
     st.subheader("Maintenance")
     st.caption("Use if the board gets out of sync with reality.")

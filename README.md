@@ -78,25 +78,36 @@ First-run defaults live at the top of [`app.py`](app.py):
 After the first launch these are stored in the database; change points, people,
 and settings from the running app rather than editing the code.
 
-## Data & storage
+## Data & storage — local SQLite + Neon backup (hybrid)
 
-All runtime state — live claims, bookings, people, charge points, and settings
-(including the admin password hash) — is stored via **SQLAlchemy**:
+The app **always runs against a fast, local SQLite file** (`charging.db`), so
+every read and write is a sub-millisecond local operation — no network latency.
+A hosted **Postgres/Neon** database, if configured, serves purely as a **durable
+backup** so nothing is lost when an ephemeral host (like Streamlit Community
+Cloud) wipes its disk:
 
-- **Production / cloud:** a persistent **PostgreSQL** database, configured with a
-  connection string in Streamlit secrets (see below).
-- **Local development:** if no database secret is set, it falls back to a local
-  SQLite file `charging.db` next to `app.py`, created automatically.
+- **On boot:** if a backup DB is configured, its contents are **restored into
+  local SQLite** (Neon is the source of truth across restarts).
+- **On every change:** the local write returns instantly, and a **background
+  worker asynchronously mirrors** the whole dataset to Neon (debounced, and it
+  retries automatically if a mirror fails). Nothing blocks the user.
+- **Manually:** a **Backup now** button on the Admin page forces an immediate
+  mirror and shows the last-backup time.
 
-> ⚠️ **Do not rely on SQLite on Streamlit Community Cloud (or any sleep/restart
-> host).** Its filesystem is **ephemeral** — the container is wiped when the app
-> sleeps, reboots, or redeploys, so a local `charging.db` is lost (people and
-> bookings disappear overnight). Use a hosted Postgres in production.
+> Why this shape? Neon-as-primary made every page ~600 ms (cross-network query
+> latency × several queries per render). Local SQLite is instant; Neon only gets
+> touched off the request path. See the Admin → Backup panel for status, and add
+> `?debug=1` to the board URL to see the local load time.
+
+> If **no** backup DB is configured, the app still works entirely on local
+> SQLite — fine for an always-on server (the disk persists), but on an ephemeral
+> host data would be lost on restart. The Admin → Backup panel warns when no
+> backup is configured.
 
 > `charging.db` and `.streamlit/secrets.toml` are git-ignored on purpose — they
 > are per-deployment runtime state / secrets. Don't commit them.
 
-### Setting up a persistent database (Postgres)
+### Setting up the backup database (Neon/Postgres)
 
 1. Create a **free** Postgres database — e.g. [Neon](https://neon.tech) or
    [Supabase](https://supabase.com). Copy its connection string; it looks like:
@@ -113,15 +124,17 @@ All runtime state — live claims, bookings, people, charge points, and settings
    url = "postgresql://user:password@host/dbname?sslmode=require"
    ```
 
-   Save — the app restarts and now reads/writes the Postgres database. Tables
-   and default settings are created automatically on first run.
+   Save — on restart the app restores from this DB (if it has data) and mirrors
+   back to it on every change. Tables are created automatically.
 
-3. **Locally** (optional, to use the same DB in dev): create
-   `.streamlit/secrets.toml` with the same content. See
-   [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example).
+3. **Locally** (optional): create `.streamlit/secrets.toml` with the same
+   content. See [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example).
 
-That's it — data now survives restarts. (A `postgres://` prefix is accepted too;
-it's normalized to `postgresql://` automatically.)
+(A `postgres://` prefix is accepted too; it's normalized to `postgresql://`.)
+
+> **One caveat:** the restore/mirror model assumes a **single app instance**
+> (true on Streamlit Community Cloud's free tier). If two instances ran at once,
+> each would mirror its own local copy and the last write would win.
 
 ## Deployment
 

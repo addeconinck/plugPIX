@@ -9,6 +9,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -115,10 +116,22 @@ settings = Table(
 )
 
 
-def _db_url() -> str:
-    """Connection URL: Streamlit secret in production, local SQLite in dev.
+# The app ALWAYS runs against this fast, local SQLite file. Neon (if configured)
+# is only a durable backup: restored into SQLite on boot, and mirrored back to
+# asynchronously whenever data changes (with automatic retry, plus a manual
+# button on the Admin page).
+LOCAL_URL = f"sqlite:///{DB_PATH}"
 
-    Set a persistent database on Streamlit Cloud via app Settings → Secrets:
+_TABLES = [live, bookings, people, points, settings]
+
+# Backup status, surfaced on the Admin page.
+_backup_status: dict = {"last_ok": None, "last_error": None, "restored": False}
+
+
+def _neon_url() -> str | None:
+    """Backup database URL from Streamlit secrets, or None if not configured.
+
+    Set on Streamlit Cloud via app Settings → Secrets:
         [database]
         url = "postgresql://user:pass@host/dbname?sslmode=require"
     """
@@ -133,7 +146,7 @@ def _db_url() -> str:
     except Exception:
         url = ""
     if not url:
-        return f"sqlite:///{DB_PATH}"
+        return None
     # SQLAlchemy needs the "postgresql://" scheme, not the older "postgres://".
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
@@ -141,29 +154,50 @@ def _db_url() -> str:
 
 
 _engines: dict[str, Engine] = {}
-_inited: set[str] = set()
 
 
-def get_engine() -> Engine:
-    url = _db_url()
+def _engine_for(url: str) -> Engine:
     if url not in _engines:
         connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
         _engines[url] = create_engine(
-            url,
-            connect_args=connect_args,
-            pool_pre_ping=True,   # transparently replace connections dropped by the server
-            pool_recycle=300,     # recycle connections older than 5 min (serverless idle)
+            url, connect_args=connect_args, pool_pre_ping=True, pool_recycle=300,
         )
     return _engines[url]
 
 
-def init_db() -> None:
-    """Create tables and seed defaults once per process (idempotent)."""
-    url = _db_url()
-    if url in _inited:
-        return
-    engine = get_engine()
-    _metadata.create_all(engine)
+def get_engine() -> Engine:
+    """The app always talks to the fast, local SQLite database."""
+    return _engine_for(LOCAL_URL)
+
+
+def get_neon_engine() -> Engine | None:
+    """The durable backup database (Postgres/Neon), or None if not configured."""
+    url = _neon_url()
+    return _engine_for(url) if url else None
+
+
+def _copy_all(src: Engine, dst: Engine) -> None:
+    """Replace every table in dst with the rows from src (full snapshot copy)."""
+    data: dict[str, list[dict]] = {}
+    with src.connect() as sconn:
+        for t in _TABLES:
+            data[t.name] = [dict(r) for r in sconn.execute(select(t)).mappings().all()]
+    with dst.begin() as dconn:
+        for t in _TABLES:
+            dconn.execute(delete(t))
+            if data[t.name]:
+                dconn.execute(insert(t), data[t.name])
+
+
+def _engine_has_data(engine: Engine) -> bool:
+    try:
+        with engine.connect() as conn:
+            return (conn.execute(select(func.count()).select_from(settings)).scalar() or 0) > 0
+    except Exception:
+        return False
+
+
+def _seed_defaults(engine: Engine) -> None:
     with engine.begin() as conn:
         if conn.execute(select(func.count()).select_from(people)).scalar() == 0:
             for name, plate in DEFAULT_PEOPLE:
@@ -175,7 +209,87 @@ def init_db() -> None:
         for key, value in DEFAULT_SETTINGS.items():
             if key not in have:
                 conn.execute(insert(settings).values(key=key, value=value))
-    _inited.add(url)
+
+
+_inited = False
+
+
+def init_db() -> None:
+    """Prepare local SQLite once per process; restore from Neon if available."""
+    global _inited
+    if _inited:
+        return
+    local = get_engine()
+    _metadata.create_all(local)
+
+    neon = get_neon_engine()
+    if neon is not None:
+        try:
+            _metadata.create_all(neon)
+            # Neon is the durable source of truth: restore it into local SQLite.
+            if _engine_has_data(neon):
+                _copy_all(src=neon, dst=local)
+                _backup_status["restored"] = True
+        except Exception as e:  # Neon unreachable → keep whatever local we have
+            _backup_status["last_error"] = f"restore failed: {e}"
+
+    _seed_defaults(local)
+    _inited = True
+    if neon is not None:
+        _start_mirror_worker()
+
+
+# ---- backup / mirror (SQLite → Neon) -------------------------------------- #
+
+_mirror_event = threading.Event()   # a change happened → mirror soon
+_mirror_dirty = threading.Event()   # local has changes not yet safely in Neon
+_mirror_thread_started = False
+_RETRY_INTERVAL = 120               # seconds; only used to retry a failed mirror
+
+
+def mirror_to_neon() -> bool:
+    """Copy local SQLite → Neon. Returns True on success (no-op if unconfigured)."""
+    neon = get_neon_engine()
+    if neon is None:
+        return False
+    try:
+        _metadata.create_all(neon)
+        _copy_all(src=get_engine(), dst=neon)
+        _backup_status["last_ok"] = now()
+        _backup_status["last_error"] = None
+        _mirror_dirty.clear()
+        return True
+    except Exception as e:
+        _backup_status["last_error"] = str(e)
+        return False
+
+
+def _mirror_worker() -> None:
+    while True:
+        # Wake immediately on a change, else every _RETRY_INTERVAL to retry a
+        # pending (failed) mirror. When nothing is dirty, the wake is a no-op.
+        _mirror_event.wait(timeout=_RETRY_INTERVAL)
+        _mirror_event.clear()
+        if not _mirror_dirty.is_set():
+            continue
+        time.sleep(2)  # debounce: coalesce a burst of quick changes
+        _mirror_event.clear()
+        mirror_to_neon()
+
+
+def _start_mirror_worker() -> None:
+    global _mirror_thread_started
+    if _mirror_thread_started:
+        return
+    threading.Thread(target=_mirror_worker, name="plugpix-mirror", daemon=True).start()
+    _mirror_thread_started = True
+
+
+def request_backup() -> None:
+    """Mark data changed and wake the worker to mirror to Neon (non-blocking)."""
+    if get_neon_engine() is not None:
+        _mirror_dirty.set()
+        _mirror_event.set()
 
 
 def now() -> dt.datetime:
@@ -209,7 +323,7 @@ def _all(stmt) -> list[dict]:
 def _exec(stmt) -> int:
     with get_engine().begin() as conn:
         rc = conn.execute(stmt).rowcount
-    _bust_board_cache()  # any write invalidates the cached board snapshot
+    request_backup()  # any write triggers an async mirror to Neon
     return rc
 
 
@@ -338,7 +452,7 @@ def add_point(name: str) -> None:
             select(func.coalesce(func.max(points.c.position), -1) + 1)
         ).scalar()
         conn.execute(insert(points).values(name=name.strip(), position=pos))
-    _bust_board_cache()
+    request_backup()
 
 
 def rename_point(point_id: int, name: str) -> None:
@@ -365,7 +479,7 @@ def set_setting(key: str, value: str) -> None:
         ).rowcount
         if not updated:
             conn.execute(insert(settings).values(key=key, value=value))
-    _bust_board_cache()
+    request_backup()
 
 
 # ---- bulk board load (one connection, a few queries) ---------------------- #
@@ -411,24 +525,6 @@ def load_board() -> dict:
         "claims": claims,
         "bookings_by_point": bookings_by_point,
     }
-
-
-# Cache the batched snapshot for a few seconds so that non-write interactions
-# (opening a popover, dragging a slider, picking a name) and rapid reruns skip
-# the database entirely. Every write busts it via _bust_board_cache().
-BOARD_CACHE_TTL = 15  # seconds
-
-
-@st.cache_data(ttl=BOARD_CACHE_TTL, show_spinner=False)
-def load_board_cached(cache_key: str) -> dict:
-    return load_board()
-
-
-def _bust_board_cache() -> None:
-    try:
-        load_board_cached.clear()
-    except Exception:
-        pass
 
 
 def active_booking_of(upcoming: list[dict], now_iso: str) -> dict | None:
@@ -777,9 +873,9 @@ def main() -> None:
     st.markdown(MOBILE_CSS, unsafe_allow_html=True)
     init_db()
 
-    # One batched, briefly-cached load per rerun instead of dozens of queries.
+    # One batched load per rerun from the local SQLite database (fast).
     _t0 = time.perf_counter()
-    board = load_board_cached(_db_url())
+    board = load_board()
     _load_ms = (time.perf_counter() - _t0) * 1000.0
     s = board["settings"]
     points = board["points"]
@@ -813,10 +909,15 @@ def main() -> None:
         f"🕐 {n.strftime('%A %d %B %Y — %H:%M:%S')} "
         f"· auto-refreshes every {refresh}s"
     )
-    # Add ?debug=1 to the URL to see where time goes (DB backend + load time).
+    # Add ?debug=1 to the URL to see where time goes (local load + backup state).
     if st.query_params.get("debug"):
-        backend = "postgres" if _db_url().startswith("postgres") else "sqlite"
-        st.caption(f"⏱ backend={backend} · load_board={_load_ms:.0f} ms")
+        bkp = "off"
+        if get_neon_engine() is not None:
+            last = _backup_status["last_ok"]
+            bkp = f"ok@{fmt_time(last)}" if last else "pending"
+            if _backup_status["last_error"]:
+                bkp = "ERROR"
+        st.caption(f"⏱ local load_board={_load_ms:.0f} ms · neon backup={bkp}")
 
     # "Alert me when any point frees up" — notify each time a point newly frees.
     if st.session_state.get("watch_any"):
