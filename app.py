@@ -363,6 +363,74 @@ def set_setting(key: str, value: str) -> None:
             conn.execute(insert(settings).values(key=key, value=value))
 
 
+# ---- bulk board load (one connection, a few queries) ---------------------- #
+
+
+def load_board() -> dict:
+    """Fetch everything the board needs in ONE connection.
+
+    The per-point helpers (active_claim/active_booking/upcoming_bookings) each
+    make a separate round-trip; on a remote database that's dozens of trips per
+    rerun. This does it in ~5 queries and lets the UI compute status in Python.
+    """
+    now_iso = iso(now())
+    with get_engine().connect() as conn:
+        claim_rows = conn.execute(
+            select(live)
+            .where(live.c.released_at.is_(None))
+            .order_by(live.c.claimed_at.desc())
+        ).mappings().all()
+        bk_rows = conn.execute(
+            select(bookings)
+            .where(bookings.c.end_at >= now_iso)
+            .order_by(bookings.c.start_at)
+        ).mappings().all()
+        pt_rows = conn.execute(
+            select(points).order_by(points.c.position, points.c.id)
+        ).mappings().all()
+        ppl_rows = conn.execute(select(people)).mappings().all()
+        set_rows = conn.execute(select(settings)).mappings().all()
+
+    claims: dict[str, dict] = {}
+    for r in claim_rows:
+        claims.setdefault(r["point"], dict(r))  # latest active claim per point
+    bookings_by_point: dict[str, list[dict]] = {}
+    for b in bk_rows:
+        bookings_by_point.setdefault(b["point"], []).append(dict(b))
+
+    return {
+        "now_iso": now_iso,
+        "settings": {r["key"]: r["value"] for r in set_rows},
+        "points": [r["name"] for r in pt_rows],
+        "people": [dict(r) for r in ppl_rows],
+        "claims": claims,
+        "bookings_by_point": bookings_by_point,
+    }
+
+
+def active_booking_of(upcoming: list[dict], now_iso: str) -> dict | None:
+    """The booking whose slot covers now, from a point's upcoming list."""
+    for b in upcoming:
+        if b["start_at"] <= now_iso < b["end_at"]:
+            return b
+    return None
+
+
+def _setting_int(s: dict, key: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return min(hi, max(lo, int(s.get(key, default))))
+    except (ValueError, TypeError):
+        return default
+
+
+def slot_bounds_from(s: dict) -> tuple[dt.time, dt.time]:
+    lo = _setting_int(s, "slot_start_hour", 6, 0, 24)
+    hi = _setting_int(s, "slot_end_hour", 22, 0, 24)
+    if hi <= lo:
+        lo, hi = 6, 22
+    return dt.time(lo, 0), dt.time(min(hi, 23), 59 if hi >= 24 else 0)
+
+
 def booking_enabled() -> bool:
     return get_setting("booking_enabled", "1") == "1"
 
@@ -498,9 +566,8 @@ def fmt_time(d: dt.datetime) -> str:
     return d.astimezone(TIMEZONE).strftime("%H:%M")
 
 
-def default_slot(is_today: bool) -> tuple[dt.time, dt.time]:
+def default_slot(is_today: bool, slot_min: dt.time, slot_max: dt.time) -> tuple[dt.time, dt.time]:
     """Default (start, end) for the booking slider — 'now' rounded up if today."""
-    slot_min, slot_max = slot_bounds()
     if not is_today:
         start = slot_min
         end = (dt.datetime.combine(now().date(), slot_min) + dt.timedelta(hours=1)).time()
@@ -526,12 +593,12 @@ def fmt_day_time(d: dt.datetime) -> str:
     return d.strftime("%a %d %b %H:%M")
 
 
-def render_point(point: str, me: str, booking_on: bool,
-                 eta_choices: dict[str, int | None]) -> None:
-    claim = active_claim(point)
-    booking_now = active_booking(point) if claim is None else None
+def render_point(point: str, me: str | None, booking_on: bool,
+                 eta_choices: dict[str, int | None], claim: dict | None,
+                 booking_now: dict | None, upcoming: list[dict],
+                 slot_min: dt.time, slot_max: dt.time) -> None:
     in_use = claim is not None or booking_now is not None
-    bookings = upcoming_bookings(point)
+    bookings = upcoming
 
     with st.container(border=True):
         header = st.columns([3, 2])
@@ -640,7 +707,6 @@ def render_point(point: str, me: str, booking_on: bool,
                 help="Select your name first.",
             )
             return
-        slot_min, slot_max = slot_bounds()
         with st.popover("📅 Book a slot today", use_container_width=True):
             st.write(f"Book **{point}** for **{me}** — today only")
             day = now().date()
@@ -648,7 +714,7 @@ def render_point(point: str, me: str, booking_on: bool,
                 "Drag to set the time slot",
                 min_value=slot_min,
                 max_value=slot_max,
-                value=default_slot(True),
+                value=default_slot(True, slot_min, slot_max),
                 step=dt.timedelta(minutes=15),
                 format="HH:mm",
                 key=f"bslot-{point}",
@@ -688,10 +754,30 @@ def main() -> None:
     st.markdown(MOBILE_CSS, unsafe_allow_html=True)
     init_db()
 
-    points = get_points()
-    refresh = refresh_seconds()
-    booking_on = booking_enabled()
-    eta_choices = build_eta_choices(max_claim_hours())
+    # One batched load per rerun instead of dozens of per-point queries.
+    board = load_board()
+    s = board["settings"]
+    points = board["points"]
+    people = board["people"]
+    claims = board["claims"]
+    bookings_by_point = board["bookings_by_point"]
+    now_iso = board["now_iso"]
+
+    booking_on = s.get("booking_enabled", "1") == "1"
+    refresh = _setting_int(s, "refresh_seconds", 30, 5, 3600)
+    eta_choices = build_eta_choices(_setting_int(s, "max_claim_hours", 8, 1, 24))
+    slot_min, slot_max = slot_bounds_from(s)
+
+    # Per-point state, computed in Python from the batched snapshot.
+    states: dict[str, tuple] = {}
+    free_now: set[str] = set()
+    for p in points:
+        claim = claims.get(p)
+        upcoming = bookings_by_point.get(p, [])
+        booking_now = active_booking_of(upcoming, now_iso) if claim is None else None
+        states[p] = (claim, booking_now, upcoming)
+        if claim is None and booking_now is None:
+            free_now.add(p)
 
     # Auto-refresh the whole board (keeps session/state, unlike a browser reload).
     st_autorefresh(interval=refresh * 1000, key="autorefresh")
@@ -704,7 +790,6 @@ def main() -> None:
     )
 
     # "Alert me when any point frees up" — notify each time a point newly frees.
-    free_now = {p for p in points if is_free(p)}
     if st.session_state.get("watch_any"):
         prev_free = st.session_state.get("prev_free")
         # prev_free is None on the run we enable it => set a baseline, don't alert yet.
@@ -718,7 +803,7 @@ def main() -> None:
     else:
         st.session_state["prev_free"] = None
 
-    people = list_people()
+    people = sorted(people, key=lambda p: p["name"].casefold())
     names = [p["name"] for p in people]
     plate_by_name = {p["name"]: p["plate"] for p in people}
 
@@ -763,7 +848,7 @@ def main() -> None:
                 st.rerun()
     elif choice:
         me = choice
-        plate = plate_of(me)
+        plate = plate_by_name.get(me, "")
         st.caption(f"🚗 {plate}" if plate else "No plate on file.")
     else:
         st.info("👆 Select your name (or add yourself) to claim or book a charge point.")
@@ -784,8 +869,12 @@ def main() -> None:
     for i in range(0, len(points), 2):
         cols = st.columns(2)
         for j, point in enumerate(points[i:i + 2]):
+            claim, booking_now, upcoming = states[point]
             with cols[j]:
-                render_point(point, me, booking_on, eta_choices)
+                render_point(
+                    point, me, booking_on, eta_choices,
+                    claim, booking_now, upcoming, slot_min, slot_max,
+                )
 
 
 if __name__ == "__main__":
