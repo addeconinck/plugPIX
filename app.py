@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -57,6 +58,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "booking_enabled": "1",         # "1"/"0" — enable the "take next slot" waiting list
     "refresh_seconds": "30",        # board auto-refresh cadence
     "max_claim_hours": "8",         # upper bound of the duration sliders
+    "autorelease_grace_min": "30",  # auto-release this many min after the stated end
+    "autorelease_cap_min": "240",   # auto-release "not sure" claims after this long
     "admin_password": _hash_pw("admin"),
 }
 
@@ -402,6 +405,38 @@ def release_point(claim_id: int) -> None:
     )
 
 
+def release_expired_claims(grace_min: int, cap_min: int) -> int:
+    """Auto-release claims left running long past their stated end (safety net).
+
+    With an ETA: released once now > ETA + grace_min. Without one ("not sure"):
+    released once now > claimed_at + cap_min. Active/slightly-over sessions are
+    left alone — this only clears forgotten ones. Returns how many were released.
+    """
+    n = now()
+    released = 0
+    with get_engine().begin() as conn:
+        rows = conn.execute(
+            select(live).where(live.c.released_at.is_(None))
+        ).mappings().all()
+        for r in rows:
+            eta = parse(r["release_eta"])
+            claimed = parse(r["claimed_at"])
+            if eta is not None:
+                expired = n > eta + dt.timedelta(minutes=grace_min)
+            elif claimed is not None:
+                expired = n > claimed + dt.timedelta(minutes=cap_min)
+            else:
+                expired = False
+            if expired:
+                conn.execute(
+                    update(live).where(live.c.id == r["id"]).values(released_at=iso(n))
+                )
+                released += 1
+    if released:
+        request_backup()
+    return released
+
+
 def is_free(point: str) -> bool:
     """A point is free when nobody is charging on it right now."""
     return active_claim(point) is None
@@ -701,6 +736,7 @@ def fmt_time(d: dt.datetime) -> str:
 # Timeline colours: muted grey for the current in-use block; the validated
 # categorical palette (fixed order) for each person waiting in line.
 _TL_BUSY = "#8a8a8a"
+_TL_OVERDUE = "#c0632f"  # warning tint for a session running past its stated end
 _TL_COLORS = [
     "#2a78d6", "#1baf7a", "#eda100", "#008300",
     "#4a3aa7", "#e34948", "#e87ba4", "#eb6834",
@@ -714,14 +750,19 @@ def schedule_segments(claim: dict | None, wait_list: list[dict]) -> list[dict]:
     segs: list[dict] = []
     cursor = n
     if claim is not None:
-        end = parse(claim["release_eta"])
-        known = bool(end and end > n)
-        occ_end = end if known else n + dt.timedelta(minutes=_DEFAULT_MIN)
+        # Start time is fixed (when they plugged in); the end is the stated ETA,
+        # but if they run past it the segment stretches to "now" (overdue).
+        start = parse(claim["claimed_at"]) or n
+        planned = parse(claim["release_eta"])
+        overdue = planned is not None and n > planned
+        occ_end = max(planned, n) if planned is not None else n
+        if occ_end <= start:
+            occ_end = start + dt.timedelta(minutes=1)
         segs.append({
-            "person": claim["person"], "start": n, "end": occ_end,
-            "minutes": max(1, (occ_end - n).total_seconds() / 60),
-            "kind": "busy", "approx": not known, "booked": None,
-            "color": _TL_BUSY, "id": None,
+            "person": claim["person"], "start": start, "end": occ_end,
+            "minutes": max(1, (occ_end - start).total_seconds() / 60),
+            "kind": "busy", "approx": True, "booked": None,
+            "overdue": overdue, "color": _TL_OVERDUE if overdue else _TL_BUSY, "id": None,
         })
         cursor = occ_end
     for idx, q in enumerate(wait_list):
@@ -780,6 +821,8 @@ def render_point(point: str, me: str | None, booking_on: bool,
     in_use = claim is not None
     can_act = me is not None
     my_entry = next((q for q in wait_list if q["person"] == me), None)
+    eta = parse(claim["release_eta"]) if claim else None
+    overdue = eta is not None and now() > eta
 
     with st.container(border=True):
         header = st.columns([3, 2])
@@ -789,9 +832,10 @@ def render_point(point: str, me: str | None, booking_on: bool,
                 st.caption("Free now")
             else:
                 st.markdown(f"### 🔴 {point}")
-                eta = parse(claim["release_eta"])
                 who = "you" if claim["person"] == me else claim["person"]
-                if eta:
+                if overdue:
+                    st.caption(f"In use by **{who}** — ⚠️ overdue since {fmt_time(eta)}")
+                elif eta:
                     st.caption(f"In use by **{who}** — free ~{fmt_time(eta)}")
                 else:
                     st.caption(f"In use by **{who}**")
@@ -818,9 +862,15 @@ def render_point(point: str, me: str | None, booking_on: bool,
                             claim_point(point, me, eta_dt)
                             st.rerun()
             else:
-                # In use → owner can release; others can queue for the next slot.
+                # In use → owner can release; anyone can clear an overdue one;
+                # otherwise others can queue for the next slot.
                 if claim["person"] == me:
                     if st.button("✅ Release", key=f"rel-{point}", use_container_width=True):
+                        release_point(claim["id"])
+                        st.rerun()
+                elif overdue:
+                    if st.button("⚠️ Free it", key=f"rel-{point}", use_container_width=True,
+                                 help=f"{claim['person']} is past their time — free the point."):
                         release_point(claim["id"])
                         st.rerun()
                 elif not booking_on:
@@ -888,6 +938,16 @@ def main() -> None:
     st.markdown(MOBILE_CSS, unsafe_allow_html=True)
     init_db()
 
+    # Safety net: auto-release sessions left running long past their time, so the
+    # board self-heals when people forget to release. Runs before the snapshot.
+    def _s_int(key: str, default: int, lo: int) -> int:
+        try:
+            return max(lo, int(get_setting(key, str(default))))
+        except (ValueError, TypeError):
+            return default
+    release_expired_claims(_s_int("autorelease_grace_min", 30, 0),
+                           _s_int("autorelease_cap_min", 240, 1))
+
     # One batched load per rerun from the local SQLite database (fast).
     _t0 = time.perf_counter()
     board = load_board()
@@ -901,6 +961,10 @@ def main() -> None:
     booking_on = s.get("booking_enabled", "1") == "1"
     refresh = _setting_int(s, "refresh_seconds", 30, 5, 3600)
     eta_choices = build_eta_choices(_setting_int(s, "max_claim_hours", 8, 1, 24))
+    # Local testing: `PLUGPIX_TEST=1` adds short durations so the queue / "your
+    # turn" flow can be exercised in minutes. Never set in production.
+    if os.environ.get("PLUGPIX_TEST"):
+        eta_choices = {"1 min": 1, "2 min": 2, "5 min": 5, **eta_choices}
 
     # Per-point state from the batched snapshot.
     free_now = {p for p in points if claims.get(p) is None}

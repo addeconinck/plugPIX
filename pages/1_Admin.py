@@ -135,6 +135,12 @@ def main() -> None:
     st.divider()
 
     # --------------------------------------------------------------- Settings
+    def _int_setting(key, default):
+        try:
+            return int(app.get_setting(key, str(default)))
+        except (ValueError, TypeError):
+            return default
+
     st.subheader("Settings")
     with st.form("settings"):
         refresh = st.number_input(
@@ -145,10 +151,22 @@ def main() -> None:
             "Max duration on the “I'll be done in…” / “I'll need it for…” sliders (hours)",
             min_value=1, max_value=24, step=1, value=app.max_claim_hours(),
         )
+        grace = st.number_input(
+            "Auto-release grace: minutes past the stated end before a claim frees itself",
+            min_value=0, max_value=600, step=5,
+            value=_int_setting("autorelease_grace_min", 30),
+        )
+        cap = st.number_input(
+            "Auto-release cap for “not sure” claims (minutes)",
+            min_value=15, max_value=1440, step=15,
+            value=_int_setting("autorelease_cap_min", 240),
+        )
         saved = st.form_submit_button("💾 Save settings", type="primary")
     if saved:
         app.set_setting("refresh_seconds", str(int(refresh)))
         app.set_setting("max_claim_hours", str(int(max_hours)))
+        app.set_setting("autorelease_grace_min", str(int(grace)))
+        app.set_setting("autorelease_cap_min", str(int(cap)))
         st.success("Settings saved.")
 
     st.divider()
